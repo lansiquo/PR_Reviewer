@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+requests
+PyJWT
+cryptography
+pydantic>=2
+python-dotenv

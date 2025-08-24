@@ -1,9 +1,5 @@
 private-key.pem
-.env.example
-.env
-.venv
 GH_key
 GH_key.pub
-.keep
-app.cpython-313.pyc
+
 

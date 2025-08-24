@@ -38,6 +38,14 @@ def test_pull_request_flow_integration():
 
     os.environ["GITHUB_WEBHOOK_SECRET"] = secret
 
+    # pick up a token and make sure the app sees it
+    tok = os.getenv("EXPLICIT_INSTALLATION_TOKEN") or os.getenv("GITHUB_TOKEN")
+    if tok:
+        os.environ["EXPLICIT_INSTALLATION_TOKEN"] = tok
+
+    
+    assert os.getenv("EXPLICIT_INSTALLATION_TOKEN"), "No token in env"
+
     import app as appmod
     reload(appmod)
 

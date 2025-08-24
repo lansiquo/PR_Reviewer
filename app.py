@@ -1,6 +1,6 @@
 # app.py
 from __future__ import annotations
-import requests
+
 import hashlib
 import hmac
 import json
@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Literal
 
-
+import requests
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 
@@ -97,11 +97,8 @@ app = FastAPI()
 
 
 # ---------------------------- Git / checkout ---------------------------------
+# app.py
 def ensure_repo_checkout(owner: str, repo_name: str, head_sha: str, token: str) -> str:
-    """
-    Ensure PR HEAD is present locally; return path.
-    Uses installation token in HTTPS URL. No interactive prompts.
-    """
     if not shutil.which("git"):
         raise FileNotFoundError("git_not_installed")
 
@@ -109,24 +106,36 @@ def ensure_repo_checkout(owner: str, repo_name: str, head_sha: str, token: str) 
     target = os.path.join(base_dir, owner, repo_name, head_sha[:12])
     os.makedirs(os.path.dirname(target), exist_ok=True)
 
-    url = f"https://x-access-token:{token}@github.com/{owner}/{repo_name}.git"
+    t = token or ""
+    # Pick URL based on token type
+    if t.startswith(("ghp_", "github_pat_")):            # PAT
+        user = os.getenv("GITHUB_USERNAME") or owner
+        repo_url = f"https://{user}:{t}@github.com/{owner}/{repo_name}.git"
+    else:                                                # Installation token (ghs_/ghu_/ghr_)
+        repo_url = f"https://x-access-token:{t}@github.com/{owner}/{repo_name}.git"
+
+    # Safe debug
+    log.info("checkout url=%s", repo_url.replace(t, "****"))
 
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "echo"
 
-    def run(*args: str) -> None:
+    def run(*args):
         subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
 
     if os.path.isdir(target):
+        # Ensure the existing worktree uses the correct remote URL
+        run("git", "-C", target, "remote", "set-url", "origin", repo_url)
         run("git", "-C", target, "fetch", "--depth", "2", "origin", head_sha)
         run("git", "-C", target, "checkout", "-f", head_sha)
     else:
-        run("git", "clone", "--no-checkout", "--depth", "2", url, target)
+        run("git", "clone", "--no-checkout", "--depth", "2", repo_url, target)
         run("git", "-C", target, "fetch", "origin", head_sha)
         run("git", "-C", target, "checkout", "-f", head_sha)
 
     return target
+
 
 
 # ---------------------------- GitHub auth ------------------------------------
@@ -141,13 +150,28 @@ def _make_app_jwt(app_id: str, private_key_pem: str) -> str:
     }
     return jwt.encode(payload, private_key_pem, algorithm="RS256")
 
+# add near your auth helpers
+def _get_private_key_text() -> Optional[str]:
+    # in-memory value first
+    if GITHUB_PRIVATE_KEY:
+        return GITHUB_PRIVATE_KEY
+    # then try the path
+    if GITHUB_PRIVATE_KEY_PATH and os.path.exists(GITHUB_PRIVATE_KEY_PATH):
+        with open(GITHUB_PRIVATE_KEY_PATH, "r") as fh:
+            key = fh.read()
+        return key.replace("\\n", "\n") if "\\n" in key else key
+    return None
+
 
 def _exchange_installation_token(installation_id: int) -> Tuple[str, int]:
-    if not (GITHUB_APP_ID and GITHUB_PRIVATE_KEY):
-        raise RuntimeError(
-            "GITHUB_APP_ID and GITHUB_PRIVATE_KEY must be set (or provide EXPLICIT_INSTALLATION_TOKEN)"
-        )
-    app_jwt = _make_app_jwt(GITHUB_APP_ID, GITHUB_PRIVATE_KEY)
+    if not GITHUB_APP_ID:
+        raise RuntimeError("GITHUB_APP_ID must be set (or provide EXPLICIT_INSTALLATION_TOKEN)")
+
+    private_key = _get_private_key_text()
+    if not private_key:
+        raise RuntimeError("GITHUB_PRIVATE_KEY(_PATH) must be set/readable (or provide EXPLICIT_INSTALLATION_TOKEN)")
+
+    app_jwt = _make_app_jwt(GITHUB_APP_ID, private_key)
     url = f"{GITHUB_API}/app/installations/{installation_id}/access_tokens"
     headers = {**API_HEADERS_BASE, "Authorization": f"Bearer {app_jwt}"}
     r = requests.post(url, headers=headers, timeout=30)

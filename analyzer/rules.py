@@ -13,6 +13,7 @@ SQL_FSTRING = re.compile(r"(execute|executemany)\(f[\"'].*[{].*[}]")
 
 ALLOW_FILE_EXT = {"py", "js", "ts", "java", "go", "rb"}
 
+
 class Analyzer:
     def scan_patch(self, filename: str, patch: str) -> List[Dict]:
         findings: List[Dict] = []

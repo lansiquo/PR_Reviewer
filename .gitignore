@@ -3,4 +3,8 @@ private-key.pem
 .env
 GH_key
 GH_key.pub
-.venv
+.venv/
+app.cpython-313.pyc
+.keep
+.venv/lib
+.venv/pyvenv.cfg

@@ -1,72 +1,58 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse
-import json, os, logging
-from verify import verify_signature
-from github import GitHubClient
-from analyzer.rules import Analyzer
+# app.py
+import hashlib, hmac, json, logging, os, sys
+from typing import Optional
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import JSONResponse
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("webhook")
+
+WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "").encode()
 
 app = FastAPI()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-@app.get("/healthz", response_class=PlainTextResponse)
+@app.get("/healthz")
 def healthz():
-    return "ok"
+    return {"status": "ok"}
 
 @app.post("/webhook")
-async def webhook(request: Request):
-    body = await request.body()
-    headers = {k.lower(): v for k, v in request.headers.items()}
+async def webhook(
+    request: Request,
+    x_github_event: Optional[str] = Header(default=None),
+    x_hub_signature_256: Optional[str] = Header(default=None),
+    x_github_delivery: Optional[str] = Header(default=None),
+):
+    body: bytes = await request.body()
+    log.info("delivery=%s event=%s len=%d", x_github_delivery, x_github_event, len(body))
 
-    # 1) Verify signature
-    secret = os.environ.get("GITHUB_WEBHOOK_SECRET")
-    if not secret:
-        raise HTTPException(status_code=500, detail="Server misconfigured: missing GITHUB_WEBHOOK_SECRET")
-    if not verify_signature(headers, body, secret):
-        raise HTTPException(status_code=401, detail="Invalid signature")
+    # Signature check only if secret is set
+    if WEBHOOK_SECRET:
+        if not (x_hub_signature_256 and x_hub_signature_256.startswith("sha256=")):
+            return JSONResponse({"ok": False, "error": "missing_or_bad_signature_header"}, status_code=400)
+        digest = hmac.new(WEBHOOK_SECRET, body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(f"sha256={digest}", x_hub_signature_256):
+            return JSONResponse({"ok": False, "error": "signature_mismatch"}, status_code=401)
 
-    event = headers.get("x-github-event")
-    payload = json.loads(body)
+    payload = {}
+    if body:
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            log.warning("Non-JSON body (len=%d)", len(body))
 
-    if event == "pull_request" and payload.get("action") in {"opened", "synchronize", "reopened"}:
-        repo = payload["repository"]["full_name"]  # owner/repo
-        owner = payload["repository"]["owner"]["login"]
-        name  = payload["repository"]["name"]
-        pr_number = payload["number"]
-        head_sha = payload["pull_request"]["head"]["sha"]
-        installation_id = (payload.get("installation") or {}).get("id")
+    # Cheap router; never index into missing keys
+    if x_github_event == "ping":
+        return JSONResponse({"ok": True, "pong": True}, status_code=200)
 
-        gh = GitHubClient(owner, name, installation_id)
+    if x_github_event == "push":
+        repo = (payload.get("repository") or {}).get("full_name")
+        ref = payload.get("ref")
+        log.info("push repo=%s ref=%s", repo, ref)
 
-        # 2) Fetch changed files (limited pagination for MVP)
-        files = gh.get_pr_files(pr_number, per_page=100, max_pages=5)
+    if x_github_event == "pull_request":
+        action = payload.get("action")
+        number = (payload.get("pull_request") or {}).get("number")
+        log.info("pull_request action=%s number=%s", action, number)
 
-        # 3) Analyze added lines only
-        analyzer = Analyzer()
-        findings = []
-        for f in files:
-            patch = f.get("patch")
-            filename = f.get("filename")
-            if not patch:
-                continue
-            findings.extend(analyzer.scan_patch(filename, patch))
-
-        # 4) Report: commit status + single PR comment
-        summary = analyzer.summarize(findings)
-        state = "success" if summary["total"] == 0 else "failure"
-        gh.set_commit_status(head_sha, state=state, context="prsec", description=summary["status_line"], target_url=None)
-
-        # Use a single issue comment for MVP (inline requires diff position mapping)
-        body_lines = ["## PR Security Reviewer\n", summary["status_line"], "\n"]
-        if findings:
-            body_lines.append("**Findings:**\n")
-            for fx in findings[:30]:  # avoid very long comments
-                body_lines.append(f"- `{fx['rule']}` in `{fx['file']}` line {fx['line']}: {fx['message']}")
-                if fx.get("suggestion"):
-                    body_lines.append(f"  \n  Fix: `{fx['suggestion']}`")
-        else:
-            body_lines.append("No issues detected in added lines.")
-
-        gh.post_issue_comment(pr_number, "\n".join(body_lines))
-        return {"ok": True, "findings": summary}
-
-    return {"ok": True, "info": "event ignored"}
+    return JSONResponse({"ok": True, "event": x_github_event, "received": bool(payload)}, status_code=200)

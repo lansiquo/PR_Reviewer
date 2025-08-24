@@ -3,3 +3,4 @@ private-key.pem
 .env
 GH_key
 GH_key.pub
+.venv

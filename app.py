@@ -118,8 +118,10 @@ INTERESTING_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 
 @app.post("/webhook", response_class=PlainTextResponse)
 async def webhook(request: Request):
+
     body = await request.body()
     verify_signature(WEBHOOK_SECRET, body, request.headers.get("X-Hub-Signature-256"))
+    print("DEBUG GITHUB_TOKEN loaded?", bool(GITHUB_TOKEN))
 
     event = request.headers.get("X-GitHub-Event", "unknown")
     delivery = request.headers.get("X-GitHub-Delivery", str(uuid.uuid4()))

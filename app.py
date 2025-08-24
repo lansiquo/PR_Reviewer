@@ -1,36 +1,37 @@
 # app.py
+from __future__ import annotations
+
 import hashlib
 import hmac
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Literal
 
 import requests
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 
+# --- analyzers ---
 from analyzers.semgrep_runner import (
     run_semgrep,
     to_github_annotations,
     summarize_findings,
 )
 
-# --------------------------------------------------------------------------------------
-# Optional GitHub App auth via PyJWT (fallback to EXPLICIT_INSTALLATION_TOKEN if set)
-#   pip install PyJWT cryptography
-# --------------------------------------------------------------------------------------
+# --- Optional GitHub App auth (PyJWT) ---
 try:
     import jwt  # PyJWT
 except Exception:  # pragma: no cover
     jwt = None
 
-# --------------------------------------------------------------------------------------
-# Logging & config
-# --------------------------------------------------------------------------------------
+# --- Logging & .env ---
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
@@ -38,37 +39,40 @@ logging.basicConfig(
 )
 log = logging.getLogger("webhook")
 
-# Load .env if present
 try:
     from dotenv import load_dotenv  # pip install python-dotenv
-
     load_dotenv()
 except Exception:
     pass
 
-# Core env
+# --- Config / env ---
 GITHUB_APP_ID = (os.getenv("GITHUB_APP_ID") or os.getenv("APP_ID") or "").strip() or None
 GITHUB_PRIVATE_KEY = (
     os.getenv("GITHUB_PRIVATE_KEY") or os.getenv("PRIVATE_KEY") or ""
 ).strip() or None
 GITHUB_PRIVATE_KEY_PATH = (os.getenv("GITHUB_PRIVATE_KEY_PATH") or "").strip() or None
 
-WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip() or None
-WEBHOOK_SECRET_BYTES = WEBHOOK_SECRET.encode("utf-8") if WEBHOOK_SECRET else None
+# accept either name for the secret
+WEBHOOK_SECRET = (
+    os.getenv("GITHUB_WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET") or ""
+).strip() or None
+WEBHOOK_SECRET_BYTES = WEBHOOK_SECRET.encode() if WEBHOOK_SECRET else None
 
-# Allow local override with an explicit token (PAT or installation token)
+# explicit token override (useful locally / CI)
 EXPLICIT_INSTALLATION_TOKEN = (
     os.getenv("EXPLICIT_INSTALLATION_TOKEN")
     or os.getenv("GITHUB_INSTALLATION_TOKEN")
     or ""
 ).strip() or None
 
-# Private key from file if path provided
-if (not GITHUB_PRIVATE_KEY) and GITHUB_PRIVATE_KEY_PATH and os.path.exists(GITHUB_PRIVATE_KEY_PATH):
-    with open(GITHUB_PRIVATE_KEY_PATH, "r") as _f:
-        GITHUB_PRIVATE_KEY = _f.read()
+# test/integration toggles
+PRSEC_SKIP_CHECKOUT = os.getenv("PRSEC_SKIP_CHECKOUT") == "1"
+PRSEC_SKIP_SEMGREP = os.getenv("PRSEC_SKIP_SEMGREP") == "1"
 
-# Fix escaped \n in env-provided private keys
+# private key from file; fix escaped \n
+if (not GITHUB_PRIVATE_KEY) and GITHUB_PRIVATE_KEY_PATH and os.path.exists(GITHUB_PRIVATE_KEY_PATH):
+    with open(GITHUB_PRIVATE_KEY_PATH, "r") as fh:
+        GITHUB_PRIVATE_KEY = fh.read()
 if GITHUB_PRIVATE_KEY and "\\n" in GITHUB_PRIVATE_KEY:
     GITHUB_PRIVATE_KEY = GITHUB_PRIVATE_KEY.replace("\\n", "\n")
 
@@ -80,88 +84,65 @@ log.info(
     bool(EXPLICIT_INSTALLATION_TOKEN),
 )
 
-# --------------------------------------------------------------------------------------
-# Constants & caches
-# --------------------------------------------------------------------------------------
+# --- Constants & state ---
 GITHUB_API = "https://api.github.com"
 API_HEADERS_BASE = {
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
     "User-Agent": "pr-security-reviewer",
 }
-
-# In-memory cache for installation tokens
 _installation_token_cache: Dict[int, Dict[str, object]] = {}
 
-# --------------------------------------------------------------------------------------
-# App
-# --------------------------------------------------------------------------------------
 app = FastAPI()
 
 
-import subprocess, shutil
-
+# ---------------------------- Git / checkout ---------------------------------
 def ensure_repo_checkout(owner: str, repo_name: str, head_sha: str, token: str) -> str:
     """
-    Ensure the PR HEAD is checked out locally and return its path.
-    Uses installation token for HTTPS auth.
+    Ensure PR HEAD is present locally; return path.
+    Uses installation token in HTTPS URL. No interactive prompts.
     """
-    base_dir = os.getenv("WORK_DIR", "/tmp/prsec")
-    target = os.path.join(base_dir, owner, repo_name, head_sha[:12])
-
     if not shutil.which("git"):
         raise FileNotFoundError("git_not_installed")
 
-    # Build an authenticated clone URL without leaking the token in logs
-    repo_url = f"https://x-access-token:{token}@github.com/{owner}/{repo_name}.git"
+    base_dir = os.getenv("WORK_DIR", "/tmp/prsec")
+    target = os.path.join(base_dir, owner, repo_name, head_sha[:12])
+    os.makedirs(os.path.dirname(target), exist_ok=True)
 
-    cmds = []
+    url = f"https://x-access-token:{token}@github.com/{owner}/{repo_name}.git"
+
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"
+
+    def run(*args: str) -> None:
+        subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+
     if os.path.isdir(target):
-        cmds = [
-            ["git", "-C", target, "fetch", "--depth", "2", "origin", head_sha],
-            ["git", "-C", target, "checkout", "-f", head_sha],
-        ]
+        run("git", "-C", target, "fetch", "--depth", "2", "origin", head_sha)
+        run("git", "-C", target, "checkout", "-f", head_sha)
     else:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        cmds = [
-            ["git", "clone", "--no-checkout", "--depth", "2", repo_url, target],
-            ["git", "-C", target, "fetch", "origin", head_sha],
-            ["git", "-C", target, "checkout", "-f", head_sha],
-        ]
-
-    for cmd in cmds:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        run("git", "clone", "--no-checkout", "--depth", "2", url, target)
+        run("git", "-C", target, "fetch", "origin", head_sha)
+        run("git", "-C", target, "checkout", "-f", head_sha)
 
     return target
 
 
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
-
-
-# --------------------------------------------------------------------------------------
-# GitHub auth helpers (App → Installation token)
-# --------------------------------------------------------------------------------------
+# ---------------------------- GitHub auth ------------------------------------
 def _make_app_jwt(app_id: str, private_key_pem: str) -> str:
-    """
-    Create a JWT signed with the GitHub App's private key.
-    """
     if not jwt:
-        raise RuntimeError("PyJWT required for App auth. `pip install PyJWT cryptography`")
+        raise RuntimeError("PyJWT required. `pip install PyJWT cryptography`")
     now = datetime.now(timezone.utc)
     payload = {
-        "iat": int(now.timestamp()) - 60,  # 1 min skew
-        "exp": int((now + timedelta(minutes=9)).timestamp()),  # <= 10 minutes per GitHub
+        "iat": int(now.timestamp()) - 60,
+        "exp": int((now + timedelta(minutes=9)).timestamp()),
         "iss": app_id,
     }
     return jwt.encode(payload, private_key_pem, algorithm="RS256")
 
 
 def _exchange_installation_token(installation_id: int) -> Tuple[str, int]:
-    """
-    Exchange App JWT → Installation access token. Returns (token, expires_at_epoch).
-    """
     if not (GITHUB_APP_ID and GITHUB_PRIVATE_KEY):
         raise RuntimeError(
             "GITHUB_APP_ID and GITHUB_PRIVATE_KEY must be set (or provide EXPLICIT_INSTALLATION_TOKEN)"
@@ -172,44 +153,62 @@ def _exchange_installation_token(installation_id: int) -> Tuple[str, int]:
     r = requests.post(url, headers=headers, timeout=30)
     r.raise_for_status()
     j = r.json()
-    token = j["token"]
-    # expires_at: e.g. "2025-08-24T13:37:00Z"
-    expires_at_str = j["expires_at"]
-    expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
-    return token, int(expires_at.timestamp())
+    expires_at = datetime.fromisoformat(j["expires_at"].replace("Z", "+00:00"))
+    return j["token"], int(expires_at.timestamp())
 
+def _resolve_installation_id(owner: str, repo: str) -> Optional[int]:
+    """
+    Resolve GitHub App installation id for a given owner/repo using the App JWT.
+    Returns None if the app isn’t installed on that repo or app creds are missing.
+    """
+    if not (GITHUB_APP_ID and GITHUB_PRIVATE_KEY):
+        return None
+    app_jwt = _make_app_jwt(GITHUB_APP_ID, GITHUB_PRIVATE_KEY)
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/installation"
+    headers = {**API_HEADERS_BASE, "Authorization": f"Bearer {app_jwt}"}
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return int(r.json()["id"])
 
-def get_installation_token(installation_id: Optional[int]) -> Optional[str]:
-    """
-    Preferred: returns an installation token for this installation_id, caching until expiry.
-    Fallback: returns EXPLICIT_INSTALLATION_TOKEN if provided (PAT or installation token).
-    """
-    # Allow hot-changing the override without restarting
-    explicit = (
-        os.getenv("EXPLICIT_INSTALLATION_TOKEN")
-        or os.getenv("GITHUB_INSTALLATION_TOKEN")
-        or ""
-    ).strip() or None
+# app.py
+def get_installation_token(installation_id: Optional[int], owner: Optional[str] = None, repo: Optional[str] = None) -> Optional[str]:
+    explicit = (os.getenv("EXPLICIT_INSTALLATION_TOKEN") or os.getenv("GITHUB_INSTALLATION_TOKEN") or "").strip() or None
     if explicit:
         return explicit
 
-    if not installation_id:
+    # prefer provided id; if missing, resolve from repo
+    iid = int(installation_id) if installation_id else None
+    if not iid and owner and repo:
+        iid = _resolve_installation_id(owner, repo)
+    if not iid:
         return None
 
-    cached = _installation_token_cache.get(installation_id)
+    cached = _installation_token_cache.get(iid)
     now = int(time.time())
-    if cached and now < int(cached["exp"]):  # not expired
+    if cached and now < int(cached["exp"]):
         return str(cached["token"])
 
-    token, exp = _exchange_installation_token(installation_id)
-    # Refresh a minute before expiry
-    _installation_token_cache[installation_id] = {"token": token, "exp": exp - 60}
+    try:
+        token, exp = _exchange_installation_token(iid)
+    except requests.HTTPError as e:
+        # If the id is wrong for this app, try resolving from repo and retry once
+        if e.response is not None and e.response.status_code == 404 and owner and repo:
+            iid2 = _resolve_installation_id(owner, repo)
+            if not iid2 or iid2 == iid:
+                raise
+            token, exp = _exchange_installation_token(iid2)
+            iid = iid2
+        else:
+            raise
+
+    _installation_token_cache[iid] = {"token": token, "exp": exp - 60}
     return token
 
 
-# --------------------------------------------------------------------------------------
-# GitHub API client and diff utilities
-# --------------------------------------------------------------------------------------
+
+# ---------------------------- GitHub client ----------------------------------
 GitStatus = Literal["added", "modified", "removed", "renamed", "copied", "changed", "unchanged"]
 
 
@@ -217,13 +216,20 @@ class GitHubClient:
     def __init__(self, token: str, base_url: str = GITHUB_API):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
-        self.session.headers.update({**API_HEADERS_BASE, "Authorization": f"Bearer {token}"})
+
+        # Installation tokens (ghs_...) use Bearer; PATs (ghp_/github_pat_) use token
+        auth = f"Bearer {token}"
+        t = token or ""
+        if t.startswith(("ghp_", "github_pat_")):
+            auth = f"token {token}"
+
+        self.session.headers.update({**API_HEADERS_BASE, "Authorization": auth})
+
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self.base_url}{path}"
         for attempt in range(5):
             resp = self.session.request(method, url, timeout=30, **kwargs)
-            # Transient handling
             if resp.status_code in (429, 502, 503, 504):
                 pause = int(resp.headers.get("Retry-After", "2"))
                 time.sleep(min(8, pause * (attempt + 1)))
@@ -237,33 +243,25 @@ class GitHubClient:
         return resp
 
     def get_pr_shas(self, owner: str, repo: str, pr_number: int) -> Tuple[str, str]:
-        r = self._request("GET", f"/repos/{owner}/{repo}/pulls/{pr_number}")
-        j = r.json()
+        j = self._request("GET", f"/repos/{owner}/{repo}/pulls/{pr_number}").json()
         return j["base"]["sha"], j["head"]["sha"]
 
     def get_changed_files(self, owner: str, repo: str, pr_number: int) -> List[Dict]:
-        page = 1
-        out: List[Dict] = []
+        page, out = 1, []
         while True:
             r = self._request(
-                "GET",
-                f"/repos/{owner}/{repo}/pulls/{pr_number}/files",
-                params={"per_page": 100, "page": page},
+                "GET", f"/repos/{owner}/{repo}/pulls/{pr_number}/files", params={"per_page": 100, "page": page}
             )
             items = r.json()
             out.extend(items)
             link = r.headers.get("Link", "")
-            if 'rel="next"' not in link or len(items) == 0:
+            if 'rel="next"' not in link or not items:
                 break
             page += 1
         return out
 
 
 def extract_paths_for_analysis(files: List[Dict]) -> List[str]:
-    """
-    Include added/modified/changed/renamed files (new filename). Exclude removed.
-    Skip obvious binaries when there's no patch (Semgrep won't analyze).
-    """
     paths: List[str] = []
     for f in files:
         status: GitStatus = f.get("status", "modified")  # type: ignore
@@ -277,7 +275,6 @@ def extract_paths_for_analysis(files: List[Dict]) -> List[str]:
         ):
             continue
         paths.append(filename)
-    # de-dup preserve order
     seen, uniq = set(), []
     for p in paths:
         if p not in seen:
@@ -286,13 +283,8 @@ def extract_paths_for_analysis(files: List[Dict]) -> List[str]:
     return uniq
 
 
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
+# ---------------------------- Helpers ----------------------------------------
 def _verify_signature(body: bytes, x_hub_signature_256: Optional[str]) -> Tuple[bool, str]:
-    """
-    Returns (ok, err). If WEBHOOK_SECRET is not configured, skip check and return (True, "").
-    """
     if not WEBHOOK_SECRET_BYTES:
         return True, ""
     if not (x_hub_signature_256 and x_hub_signature_256.startswith("sha256=")):
@@ -304,9 +296,12 @@ def _verify_signature(body: bytes, x_hub_signature_256: Optional[str]) -> Tuple[
     return True, ""
 
 
-# --------------------------------------------------------------------------------------
-# Webhook
-# --------------------------------------------------------------------------------------
+# ---------------------------- Routes -----------------------------------------
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
 @app.post("/webhook")
 async def webhook(
     request: Request,
@@ -317,13 +312,10 @@ async def webhook(
     body: bytes = await request.body()
     log.info("delivery=%s event=%s len=%d", x_github_delivery, x_github_event, len(body))
 
-    # Signature verification (if secret configured)
     ok, err = _verify_signature(body, x_hub_signature_256)
     if not ok:
-        status = 400 if err == "missing_or_bad_signature_header" else 401
-        return JSONResponse({"ok": False, "error": err}, status_code=status)
+        return JSONResponse({"ok": False, "error": err}, status_code=400 if err.startswith("missing") else 401)
 
-    # Parse JSON if present
     payload: Dict = {}
     if body:
         try:
@@ -331,14 +323,8 @@ async def webhook(
         except Exception:
             log.warning("Non-JSON body (len=%d)", len(body))
 
-    # Cheap router; avoid indexing missing keys
     if x_github_event == "ping":
         return JSONResponse({"ok": True, "pong": True}, status_code=200)
-
-    if x_github_event == "push":
-        repo = (payload.get("repository") or {}).get("full_name")
-        ref = payload.get("ref")
-        log.info("push repo=%s ref=%s", repo, ref)
 
     if x_github_event == "pull_request":
         action = payload.get("action")
@@ -357,12 +343,10 @@ async def webhook(
             prnum = int(number)
             installation_id = (payload.get("installation") or {}).get("id")
 
-            # Acquire an installation token (or use env override)
-            token = get_installation_token(installation_id)
+            token = get_installation_token(installation_id, owner=owner, repo=repo_name)
             if not token:
                 log.error(
-                    "No installation token available. Provide EXPLICIT_INSTALLATION_TOKEN "
-                    "or configure GITHUB_APP_ID/GITHUB_PRIVATE_KEY and ensure installation_id is present."
+                    "No installation token; set EXPLICIT_INSTALLATION_TOKEN or configure App credentials."
                 )
                 return JSONResponse({"ok": False, "error": "no_installation_token"}, status_code=500)
 
@@ -373,44 +357,46 @@ async def webhook(
                 changed_paths = extract_paths_for_analysis(raw_files)
             except requests.HTTPError as e:
                 log.exception("GitHub API error while fetching PR data")
-                return JSONResponse(
-                    {"ok": False, "error": "github_api_error", "detail": str(e)}, status_code=502
-                )
+                return JSONResponse({"ok": False, "error": "github_api_error", "detail": str(e)}, status_code=502)
 
             log.info("pr=%s base=%s head=%s changed_files=%d", prnum, base_sha, head_sha, len(changed_paths))
 
-            # -- Step 2: run Semgrep on changed files -----------------------
-           # After you compute base_sha, head_sha, changed_paths
-            try:
-                repo_root = ensure_repo_checkout(owner, repo_name, head_sha, token)
-            except FileNotFoundError as e:
-                err = str(e)
-                if err == "git_not_installed":
-                    return JSONResponse({"ok": False, "error": "git_not_installed"}, status_code=500)
-                return JSONResponse({"ok": False, "error": "repo_checkout_path_error", "detail": err}, status_code=500)
-            except subprocess.CalledProcessError as e:
-                return JSONResponse(
-                    {"ok": False, "error": "git_checkout_failed", "detail": e.stderr.decode("utf-8", "ignore")},
-                    status_code=502,
+            # Repo checkout (skippable for tests)
+            if PRSEC_SKIP_CHECKOUT:
+                repo_root = tempfile.mkdtemp(prefix="prsec_")
+            else:
+                try:
+                    repo_root = ensure_repo_checkout(owner, repo_name, head_sha, token)
+                except FileNotFoundError as e:
+                    if str(e) == "git_not_installed":
+                        return JSONResponse({"ok": False, "error": "git_not_installed"}, status_code=500)
+                    return JSONResponse({"ok": False, "error": "repo_checkout_path_error", "detail": str(e)}, status_code=500)
+                except subprocess.CalledProcessError as e:
+                    return JSONResponse(
+                        {"ok": False, "error": "git_checkout_failed", "detail": e.stderr.decode("utf-8", "ignore")},
+                        status_code=502,
+                    )
+
+            # Semgrep (skippable for tests)
+            counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+            summary_md = "Semgrep skipped."
+            annotations = []
+            if PRSEC_SKIP_SEMGREP:
+                log.info("semgrep skipped via PRSEC_SKIP_SEMGREP=1")
+            else:
+                if not shutil.which("semgrep"):
+                    return JSONResponse({"ok": False, "error": "semgrep_not_installed"}, status_code=500)
+                semgrep_config = os.getenv("SEMGREP_CONFIG", "p/ci")
+                findings = run_semgrep(
+                    paths=changed_paths,
+                    repo_root=repo_root,
+                    config=semgrep_config,
+                    exclude=["tests/**", "**/vendor/**", "**/node_modules/**"],
+                    timeout_s=60,
                 )
-
-            # Optional: ensure semgrep is installed before calling your runner
-            if not shutil.which("semgrep"):
-                return JSONResponse({"ok": False, "error": "semgrep_not_installed"}, status_code=500)
-
-            semgrep_config = os.getenv("SEMGREP_CONFIG", "p/ci")
-            findings = run_semgrep(
-                paths=changed_paths,
-                repo_root=repo_root,
-                config=semgrep_config,
-                exclude=["tests/**", "**/vendor/**", "**/node_modules/**"],
-                timeout_s=60,
-            )
-
-            counts, summary_md = summarize_findings(findings)
-            annotations = to_github_annotations(findings, max_per_file=10)
-
-            log.info("semgrep findings: %s", counts)
+                counts, summary_md = summarize_findings(findings)
+                annotations = to_github_annotations(findings, max_per_file=10)
+                log.info("semgrep findings: %s", counts)
 
             return JSONResponse(
                 {
@@ -420,7 +406,7 @@ async def webhook(
                     "base": base_sha,
                     "head": head_sha,
                     "changed_count": len(changed_paths),
-                    "changed_paths": changed_paths[:20],  # preview only
+                    "changed_paths": changed_paths[:20],
                     "truncated": len(changed_paths) > 20,
                     "semgrep_counts": counts,
                     "semgrep_summary": summary_md,
@@ -429,4 +415,5 @@ async def webhook(
                 status_code=200,
             )
 
+    # default fall-through
     return JSONResponse({"ok": True, "event": x_github_event, "received": bool(payload)}, status_code=200)

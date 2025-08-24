@@ -1,24 +1,31 @@
-# tests/test_webhook.py
-import os, json, hmac, hashlib
+import os
+import json
+import hmac
+import hashlib
 from importlib import reload
+
 from fastapi.testclient import TestClient
+
 
 def _sign(secret: str, body: bytes) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
-def test_pull_request_flow(monkeypatch):
-    # Set secret and re-import app to pick it up
+
+def test_webhook_smoke(monkeypatch):
+    # Minimal env so signature check passes
     os.environ["GITHUB_WEBHOOK_SECRET"] = "testsecret"
 
     import app as appmod
-    reload(appmod)  # re-read env into WEBHOOK_SECRET
+    reload(appmod)
 
-    # Mock token acquisition
-    monkeypatch.setattr(appmod, "get_installation_token", lambda _id: "dummy-token")
+    # ---- Hard stubs: NO network, NO git, NO semgrep ----
 
-    # Stub GitHub client so no real network calls happen
+    # 1) Never mint/fetch real tokens
+    monkeypatch.setattr(appmod, "get_installation_token", lambda *a, **k: "dummy-token", raising=True)
+
+    # 2) Replace GitHub client with a stub
     class DummyGH(appmod.GitHubClient):
-        def __init__(self, token: str, base_url: str = appmod.GITHUB_API):
+        def __init__(self, *a, **k):  # ignore token/base_url
             pass
         def get_pr_shas(self, owner: str, repo: str, pr_number: int):
             return ("base123", "head456")
@@ -26,28 +33,43 @@ def test_pull_request_flow(monkeypatch):
             return [
                 {"filename": "app.py", "status": "modified", "patch": "@@..."},
                 {"filename": "README.md", "status": "added", "patch": "@@..."},
-                {"filename": "logo.png", "status": "added"}  # skipped (binary, no patch)
+                {"filename": "logo.png", "status": "added"},  # skipped (binary/no patch)
             ]
 
-    monkeypatch.setattr(appmod, "GitHubClient", DummyGH)
+    monkeypatch.setattr(appmod, "GitHubClient", DummyGH, raising=True)
 
+    # 3) Never run real git
+    monkeypatch.setattr(appmod, "ensure_repo_checkout", lambda *a, **k: "/tmp/fake-repo", raising=True)
+
+    # 4) Pretend semgrep exists and returns no findings
+    #    (app checks shutil.which("semgrep") before calling run_semgrep)
+    monkeypatch.setattr(appmod.shutil, "which", lambda *_: "/usr/bin/semgrep", raising=False)
+
+    # stub the semgrep runner functions
+    import analyzers.semgrep_runner as sr
+    monkeypatch.setattr(sr, "run_semgrep", lambda **kwargs: [], raising=True)
+    monkeypatch.setattr(sr, "summarize_findings",
+                        lambda f: ({"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}, "summary"),
+                        raising=True)
+    monkeypatch.setattr(sr, "to_github_annotations", lambda *a, **k: [], raising=True)
+
+    # ---- exercise the endpoint ----
     client = TestClient(appmod.app)
 
     payload = {
         "action": "opened",
         "number": 42,
-        "pull_request": {"number": 42, "head": {"sha": "head456"}},
+        "pull_request": {"number": 42},
         "repository": {
             "name": "demo-repo",
             "full_name": "octo/demo-repo",
-            "owner": {"login": "octo"}
+            "owner": {"login": "octo"},
         },
-        "installation": {"id": 123456}
     }
     body = json.dumps(payload).encode()
     headers = {
         "X-GitHub-Event": "pull_request",
-        "X-GitHub-Delivery": "test-123",
+        "X-GitHub-Delivery": "smoke-123",
         "X-Hub-Signature-256": _sign("testsecret", body),
         "Content-Type": "application/json",
     }

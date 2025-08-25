@@ -15,9 +15,8 @@ import requests
 import certifi
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
-
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=".env")   # 
+load_dotenv(dotenv_path=".env")  # load env if present
 
 # --- analyzers ---
 from analyzers.semgrep_runner import (
@@ -32,7 +31,7 @@ except Exception:  # pragma: no cover
     jwt = None
 
 # ---------------- App / Logging ----------------
-app = FastAPI(title="PRSec Webhook", version="2.0.0")
+app = FastAPI(title="PRSec Webhook", version="2.1.0")
 log = logging.getLogger("webhook")
 logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 BOOT_TS = time.time()
@@ -98,10 +97,6 @@ def _ca_bundle() -> str:
         or certifi.where()
     )
 
-def _deadline_guard(start_ts: float, limit_s: int, stage: str) -> None:
-    if limit_s and (time.time() - start_ts) > limit_s:
-        raise RuntimeError(f"pipeline deadline exceeded before {stage} (>{limit_s}s)")
-
 def _read_private_key() -> str:
     if APP_PEM_PATH:
         key = Path(APP_PEM_PATH).read_text()
@@ -121,28 +116,6 @@ def _create_app_jwt() -> str:
     payload = {"iat": now - 60, "exp": now + 9 * 60, "iss": APP_ID}
     token = jwt.encode(payload, key, algorithm="RS256")
     return token.decode() if isinstance(token, (bytes, bytearray)) else token
-
-def _get_installation_token(installation_id: int) -> str:
-    """
-    Prefer per-installation token from the event; fallback to EXPLICIT_INSTALLATION_TOKEN
-    only when forced or missing id.
-    """
-    if installation_id and not FORCE_EXPLICIT_TOKEN:
-        app_jwt = _create_app_jwt()
-        url = f"{GITHUB_API}/app/installations/{installation_id}/access_tokens"
-        r = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},
-            timeout=HTTP_TIMEOUT_S,
-            verify=_ca_bundle(),
-        )
-        if r.status_code >= 400:
-            log.error("POST %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
-        r.raise_for_status()
-        return r.json()["token"]
-    if EXPLICIT_INSTALLATION_TOKEN:
-        return EXPLICIT_INSTALLATION_TOKEN
-    raise RuntimeError("No installation token available")
 
 # ---- central GH request with 401 auto-retry (fresh installation token) ----
 def _gh_request(
@@ -194,6 +167,28 @@ def _get_json(url: str, token: str, params: Optional[dict] = None, install_id: O
         log.error("GET %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
     r.raise_for_status()
     return r.json()
+
+def _get_installation_token(installation_id: int) -> str:
+    """
+    Prefer per-installation token from the event; fallback to EXPLICIT_INSTALLATION_TOKEN
+    only when forced or missing id.
+    """
+    if installation_id and not FORCE_EXPLICIT_TOKEN:
+        app_jwt = _create_app_jwt()
+        url = f"{GITHUB_API}/app/installations/{installation_id}/access_tokens"
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},
+            timeout=HTTP_TIMEOUT_S,
+            verify=_ca_bundle(),
+        )
+        if r.status_code >= 400:
+            log.error("POST %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
+        r.raise_for_status()
+        return r.json()["token"]
+    if EXPLICIT_INSTALLATION_TOKEN:
+        return EXPLICIT_INSTALLATION_TOKEN
+    raise RuntimeError("No installation token available")
 
 # ---------- GitHub Checks helpers ----------
 def _create_check_in_progress(owner: str, repo: str, head_sha: str, name: str,
@@ -266,7 +261,8 @@ def list_changed_files(owner: str, repo: str, pr: int, token: str, install_id: O
     files: List[str] = []
     page = 1
     while True:
-        js = _get_json(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr}/files", token, params={"per_page": 100, "page": page}, install_id=install_id)
+        js = _get_json(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr}/files", token,
+                       params={"per_page": 100, "page": page}, install_id=install_id)
         if not js:
             break
         files.extend([x["filename"] for x in js if isinstance(x.get("filename"), str)])
@@ -283,7 +279,7 @@ def download_tarball(owner: str, repo: str, sha: str, token: str, install_id: Op
     r.raise_for_status()
     tar_bytes = io.BytesIO(r.content)
     with tarfile.open(fileobj=tar_bytes, mode="r:gz") as tf:
-        tf.extractall(workdir)  # GitHub tarball is trusted
+        tf.extractall(workdir)  # extracting tarball from GitHub release
         top = next((m for m in tf.getmembers() if m.isdir() and "/" not in m.name.strip("/")), None)
     if not top:
         subs = [p for p in workdir.iterdir() if p.is_dir()]
@@ -364,14 +360,38 @@ def run_semgrep_pipeline(
                 changed = []
             paths = changed or [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
 
+            # ensure we only pass existing files; otherwise fall back to repo-wide scan
+            existing = [p for p in paths if (repo_root / p).exists()]
+            if not existing:
+                existing = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
+
+            # Resolve Semgrep config: prefer env, then repo dotfile, else a secure default
+            cfg = SEMGREP_CONFIG
+            if not cfg:
+                for name in (".semgrep.yaml", ".semgrep.yml"):
+                    cand = repo_root / name
+                    if cand.exists():
+                        cfg = str(cand)
+                        break
+            if not cfg:
+                cfg = "p/security-audit"  # default ruleset so we never scan with zero rules
+
+            # Excludes: use env if set, else a sane default set
+            ex = SEMGREP_EXCLUDE if SEMGREP_EXCLUDE else [".venv", "venv", ".git"]
+
+            log.info("SEMGREP_CONFIG=%s EXCLUDE=%s", cfg, ex)
+            log.info("PR changed files: %s", changed)
+            log.info("Semgrep scan root=%s paths_count=%d sample=%s",
+                     repo_root, len(existing), existing[:10])
+
             # Semgrep
             findings: List[Dict[str, Any]] = []
             try:
                 findings = run_semgrep(
-                    paths=paths,
+                    paths=existing,           # use filtered list
                     repo_root=str(repo_root),
-                    config=SEMGREP_CONFIG,
-                    exclude=SEMGREP_EXCLUDE,
+                    config=cfg,               # guaranteed non-empty
+                    exclude=ex,
                     timeout_s=SEMGREP_TIMEOUT_S,
                 )
             except Exception as e:

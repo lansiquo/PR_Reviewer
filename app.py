@@ -1,4 +1,5 @@
 #### app.py
+<<<<<<< HEAD
 """
 BEGINNER-FRIENDLY WALKTHROUGH COMMENTS
 =====================================
@@ -39,6 +40,8 @@ Notes for non-coders:
 """
 
 
+=======
+>>>>>>> 6154cfc (commit for change)
 import os
 import io
 import json

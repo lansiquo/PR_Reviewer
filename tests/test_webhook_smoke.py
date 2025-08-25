@@ -12,60 +12,48 @@ def _sign(secret: str, body: bytes) -> str:
 
 
 def test_webhook_smoke(monkeypatch):
-    # Minimal env so signature check passes
+    # Make signature verification pass (app supports either var)
     os.environ["GITHUB_WEBHOOK_SECRET"] = "testsecret"
+    os.environ["GITHUB_WEBHOOK_SECRETS"] = "testsecret"
 
     import app as appmod
     reload(appmod)
 
-    ## testing
 
-    # ---- Hard stubs: NO network, NO git, NO semgrep ----
+    # Never mint/fetch real tokens
+    monkeypatch.setattr(appmod, "_get_installation_token", lambda *a, **k: "dummy-token", raising=True)
 
-    # 1) Never mint/fetch real tokens
-    monkeypatch.setattr(appmod, "get_installation_token", lambda *a, **k: "dummy-token", raising=True)
+    # No outbound GitHub calls (comments)
+    monkeypatch.setattr(appmod, "_post_json", lambda *a, **k: {}, raising=True)
 
-    # 2) Replace GitHub client with a stub
-    class DummyGH(appmod.GitHubClient):
-        def __init__(self, *a, **k):  # ignore token/base_url
-            pass
-        def get_pr_shas(self, owner: str, repo: str, pr_number: int):
-            return ("base123", "head456")
-        def get_changed_files(self, owner: str, repo: str, pr_number: int):
-            return [
-                {"filename": "app.py", "status": "modified", "patch": "@@..."},
-                {"filename": "README.md", "status": "added", "patch": "@@..."},
-                {"filename": "logo.png", "status": "added"},  # skipped (binary/no patch)
-            ]
+    # Do not actually create a check run (return fake owner/repo/id)
+    monkeypatch.setattr(
+        appmod,
+        "create_check_in_progress_with_fallback",
+        lambda *a, **k: ("octo", "demo-repo", 123),
+        raising=True,
+    )
 
-    monkeypatch.setattr(appmod, "GitHubClient", DummyGH, raising=True)
+    # Avoid filesystem/network in the pipeline and watchdog sleeps
+    monkeypatch.setattr(appmod, "run_semgrep_pipeline", lambda *a, **k: None, raising=True)
+    monkeypatch.setattr(appmod, "watchdog_timeout_check", lambda *a, **k: None, raising=True)
 
-    # 3) Never run real git
-    monkeypatch.setattr(appmod, "ensure_repo_checkout", lambda *a, **k: "/tmp/fake-repo", raising=True)
-
-    # 4) Pretend semgrep exists and returns no findings
-    #    (app checks shutil.which("semgrep") before calling run_semgrep)
-    monkeypatch.setattr(appmod.shutil, "which", lambda *_: "/usr/bin/semgrep", raising=False)
-
-    # stub the semgrep runner functions
-    import analyzers.semgrep_runner as sr
-    monkeypatch.setattr(sr, "run_semgrep", lambda **kwargs: [], raising=True)
-    monkeypatch.setattr(sr, "summarize_findings",
-                        lambda f: ({"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}, "summary"),
-                        raising=True)
-    monkeypatch.setattr(sr, "to_github_annotations", lambda *a, **k: [], raising=True)
-
-    # ---- exercise the endpoint ----
     client = TestClient(appmod.app)
 
+    # Payload structure that the handler expects
     payload = {
         "action": "opened",
         "number": 42,
-        "pull_request": {"number": 42},
-        "repository": {
-            "name": "demo-repo",
-            "full_name": "octo/demo-repo",
-            "owner": {"login": "octo"},
+        "installation": {"id": 999},
+        "pull_request": {
+            "head": {
+                "sha": "head456",
+                "repo": {"name": "demo-repo", "owner": {"login": "octo"}},
+            },
+            "base": {
+                "sha": "base123",
+                "repo": {"name": "demo-repo", "owner": {"login": "octo"}},
+            },
         },
     }
     body = json.dumps(payload).encode()
@@ -78,12 +66,11 @@ def test_webhook_smoke(monkeypatch):
 
     resp = client.post("/webhook", content=body, headers=headers)
     assert resp.status_code == 200, resp.text
-    j = resp.json()
-    assert j["ok"] is True
-    assert j["pr"] == 42
-    assert j["base"] == "base123"
-    assert j["head"] == "head456"
-    assert j["changed_count"] == 2
-    assert "app.py" in j["changed_paths"]
-    assert "README.md" in j["changed_paths"]
-    assert "logo.png" not in j["changed_paths"]
+    assert resp.json() == {
+        "ok": True,
+        "event": "pull_request",
+        "action": "opened",
+        "pr": 42,
+        "head": "head456",
+        "base": "base123",
+    }

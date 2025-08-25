@@ -1,7 +1,8 @@
-# bad.py
+# Change please
+# # bad.py
 # Intentionally-insecure snippets for Semgrep testing. (touched to trigger scan)
 # Do NOT import or run in production.
-#
+###
 
 import subprocess
 import hashlib

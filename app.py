@@ -25,7 +25,19 @@ Notes for non-coders:
 - "Check Run" = the little status lines you see on a PR (e.g., checks passing).
 - "Semgrep" = a tool that scans code for possible security or quality issues.
 - "tarball" = a compressed bundle of files. GitHub can give us one for a commit.
+
+
+Notes for non-coders:
+- A *function* is a named block of code that performs a job. We add short
+  docstrings ("what this does") and inline comments ("why/how") to explain.
+- "env var" (environment variable) = a setting provided from the outside,
+  like a secret or a timeout. This keeps secrets out of code.
+- "token" = a temporary key we use to call GitHub's API as our GitHub App.
+- "Check Run" = the little status lines you see on a PR (e.g., checks passing).
+- "Semgrep" = a tool that scans code for possible security or quality issues.
+- "tarball" = a compressed bundle of files. GitHub can give us one for a commit.
 """
+
 
 import os
 import io

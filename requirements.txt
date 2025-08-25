@@ -6,3 +6,5 @@ cryptography
 pydantic>=2
 python-dotenv
 semgrep
+pytest
+httpx

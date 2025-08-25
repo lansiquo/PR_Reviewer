@@ -1,26 +1,19 @@
-import os, requests
-from datetime import datetime, timezone, timedelta
-import jwt  # pip install PyJWT cryptography
+import os, time, json, requests
+import jwt  # PyJWT
 
-APP_ID = os.getenv("GITHUB_APP_ID")
-PK_PATH = os.getenv("GITHUB_PRIVATE_KEY_PATH")
-OWNER = os.getenv("IT_OWNER"); REPO = os.getenv("IT_REPO")
+APP_ID = os.environ["GITHUB_APP_ID"]
+APP_PEM = os.environ["GITHUB_APP_PRIVATE_KEY"].replace("\\n", "\n").strip()
+INSTALLATION_ID = int(os.environ["INSTALLATION_ID"])
+GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com")
 
-if not all([APP_ID, PK_PATH, OWNER, REPO]):
-    raise SystemExit("Set GITHUB_APP_ID, GITHUB_PRIVATE_KEY_PATH, IT_OWNER, IT_REPO in .env")
+now = int(time.time())
+payload = {"iat": now - 60, "exp": now + 9 * 60, "iss": APP_ID}
+app_jwt = jwt.encode(payload, APP_PEM, algorithm="RS256")
+if isinstance(app_jwt, (bytes, bytearray)): app_jwt = app_jwt.decode()
 
-with open(PK_PATH, "r") as f:
-    key = f.read()
-
-now = datetime.now(timezone.utc)
-payload = {"iat": int(now.timestamp()) - 60, "exp": int((now + timedelta(minutes=9)).timestamp()), "iss": APP_ID}
-app_jwt = jwt.encode(payload, key, algorithm="RS256")
-
-h = {"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"}
-# resolve installation id for this repo
-r = requests.get(f"https://api.github.com/repos/{OWNER}/{REPO}/installation", headers=h, timeout=30)
-r.raise_for_status(); inst_id = r.json()["id"]
-
-# exchange for installation token
-r = requests.post(f"https://api.github.com/app/installations/{inst_id}/access_tokens", headers=h, timeout=30)
-r.raise_for_status(); print(r.json()["token"])
+r = requests.post(f"{GITHUB_API}/app/installations/{INSTALLATION_ID}/access_tokens",
+                  headers={"Authorization": f"Bearer {app_jwt}",
+                           "Accept": "application/vnd.github+json"},
+                  timeout=20)
+r.raise_for_status()
+print(json.dumps(r.json(), indent=2))

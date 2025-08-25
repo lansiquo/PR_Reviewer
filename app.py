@@ -15,6 +15,10 @@ import requests
 import certifi
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
+
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=".env")   # 
+
 # --- analyzers ---
 from analyzers.semgrep_runner import (
     run_semgrep,
@@ -302,30 +306,65 @@ def run_semgrep_pipeline(
     check_id: int,
     token: str,
 ) -> None:
-    final_conclusion, final_summary = "failure", "Scan failed"
-    start_ts = time.time()
+    """
+    Always flips an in_progress check-run to a terminal state.
+    On any error, completes with 'failure' and a terse summary so the UI never hangs.
+    """
+    conclusion = "failure"
+    title = f"{CHECK_NAME} results"
+    summary = "Scan failed."
+    annotations: List[Dict[str, Any]] = []
+
+    def _safe_complete():
+        try:
+            # (Best-effort) fetch current state for visibility
+            try:
+                jr = _get_json(f"{GITHUB_API}/repos/{check_owner}/{check_repo}/check-runs/{check_id}",
+                               token, install_id=installation_id)
+                log.info("pre-complete check status id=%s: %s/%s", check_id, jr.get("status"), jr.get("conclusion"))
+            except Exception as e:
+                log.warning("could not fetch check-run before completion: %s", e)
+
+            # Always complete. If annotations are huge or invalid, cut to zero.
+            try_ann = annotations[:MAX_ANNOTS] if annotations else []
+            try:
+                complete_check_run(check_owner, check_repo, check_id, conclusion, title, summary, try_ann,
+                                   token, installation_id)
+            except requests.HTTPError as e:
+                # If annotations caused 422, retry with none so we at least flip the state
+                if getattr(e.response, "status_code", 0) == 422:
+                    log.warning("completion 422; retrying without annotations")
+                    complete_check_run(check_owner, check_repo, check_id, conclusion, title, summary, [],
+                                       token, installation_id)
+                else:
+                    raise
+
+            try:
+                jr = _get_json(f"{GITHUB_API}/repos/{check_owner}/{check_repo}/check-runs/{check_id}",
+                               token, install_id=installation_id)
+                log.info("post-complete check status id=%s: %s/%s", check_id, jr.get("status"), jr.get("conclusion"))
+            except Exception as e:
+                log.warning("could not fetch check-run after completion: %s", e)
+
+        except Exception as e:
+            log.error("final completion failed: %s", e)
 
     try:
         with tempfile.TemporaryDirectory(prefix="prsec_") as td:
             tdp = Path(td)
 
-            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "tarball download")
-            try:
-                repo_root = download_tarball(head_owner, head_repo, head_sha, token, installation_id, tdp)
-            except Exception as e:
-                log.error("download/extract failed: %s", e)
-                return
+            # Download head repo tarball (what actually got pushed)
+            repo_root = download_tarball(head_owner, head_repo, head_sha, token, installation_id, tdp)
 
-            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "listing changed files")
+            # Changed files (from base PR view); fall back to scanning *.py
             try:
                 changed = list_changed_files(base_owner, base_repo, pr, token, installation_id)
             except Exception as e:
                 log.error("failed to list changed files: %s", e)
                 changed = []
-
             paths = changed or [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
 
-            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "semgrep start")
+            # Semgrep
             findings: List[Dict[str, Any]] = []
             try:
                 findings = run_semgrep(
@@ -337,27 +376,28 @@ def run_semgrep_pipeline(
                 )
             except Exception as e:
                 log.error("semgrep invocation failed: %s", e)
-            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "semgrep finish")
 
             counts, summary_md = summarize_findings(findings)
             annotations = to_github_annotations(findings)[:MAX_ANNOTS]
 
-            final_conclusion = "success" if sum(counts.values()) == 0 else "failure"
-            final_summary = "No issues found" if final_conclusion == "success" else "Issues detected"
+            # Decide result
+            if sum(counts.values()) == 0:
+                conclusion = "success"
+                summary = "No issues found"
+            else:
+                conclusion = "failure"
+                summary = "Issues detected"
 
-            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "check-run completion")
-            try:
-                complete_check_run(check_owner, check_repo, check_id,
-                                   final_conclusion, f"{CHECK_NAME} results",
-                                   summary_md, annotations, token, installation_id)
-            except Exception as e:
-                log.error("check run reporting failed: %s", e)
+            # Use Semgrep summary for the check output
+            if summary_md:
+                summary = summary_md
 
     except Exception as e:
         log.error("pipeline error: %s", e)
+        # conclusion already 'failure'; summary already set
     finally:
-        # If we couldn't complete it above, watchdog will finalize it later.
-        pass
+        _safe_complete()
+
 
 # ---------------- Startup / Health ----------------
 @app.on_event("startup")

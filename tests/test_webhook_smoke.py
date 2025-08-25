@@ -18,6 +18,8 @@ def test_webhook_smoke(monkeypatch):
     import app as appmod
     reload(appmod)
 
+    ## testing
+
     # ---- Hard stubs: NO network, NO git, NO semgrep ----
 
     # 1) Never mint/fetch real tokens

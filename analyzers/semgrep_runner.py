@@ -200,14 +200,26 @@ def _resolve_config(cfg: Optional[str], repo_root: str) -> str:
     Resolve SEMGREP config:
       - if cfg is provided, use it
       - else use env SEMGREP_CONFIG (or typo SEMGRP_CONFIG), else 'p/ci'
-      - if it looks like a path, make it absolute relative to repo_root
+      - if it looks like a local path, make it absolute relative to repo_root
+      - BUT: semgrep registry IDs (p/... or r/...), 'auto', and URLs are NOT paths
     """
-    value = cfg or os.getenv("SEMGREP_CONFIG") or os.getenv("SEMGRP_CONFIG") or "p/ci"
+    value = (cfg or os.getenv("SEMGREP_CONFIG") or os.getenv("SEMGRP_CONFIG") or "p/ci").strip()
+
+    # pass-through values that are not filesystem paths
+    if (
+        value.startswith(("p/", "r/"))         # Semgrep registry
+        or value in {"auto", "semgrep-auto"}   # special selectors
+        or value.startswith(("http://", "https://"))  # remote config
+    ):
+        return value
+
+    # treat only real paths as paths
     if _looks_like_path(value):
         abs_repo = os.path.abspath(repo_root)
-        abs_path = os.path.abspath(os.path.join(abs_repo, value))
-        return abs_path
+        return os.path.abspath(os.path.join(abs_repo, value))
+
     return value
+
 
 
 def _looks_like_path(s: str) -> bool:

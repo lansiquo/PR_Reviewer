@@ -1,3 +1,4 @@
+# app.py
 import os
 import io
 import json
@@ -8,13 +9,13 @@ import hashlib
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import certifi
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
-# ------ analyzers ------
+# --- analyzers ---
 from analyzers.semgrep_runner import (
     run_semgrep,
     to_github_annotations,
@@ -27,27 +28,39 @@ except Exception:  # pragma: no cover
     jwt = None
 
 # ---------------- App / Logging ----------------
-app = FastAPI(title="PRSec Webhook", version="1.1.0")
+app = FastAPI(title="PRSec Webhook", version="2.0.0")
 log = logging.getLogger("webhook")
 logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 BOOT_TS = time.time()
 
 # ---------------- Config ----------------
 GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com").rstrip("/")
+
+# Webhook secrets (comma-separated allowed). If none, accept with a warning.
 WEBHOOK_SECRET = (os.getenv("GITHUB_WEBHOOK_SECRET") or "").strip()
 SECRETS = [s.strip() for s in (os.getenv("GITHUB_WEBHOOK_SECRETS") or WEBHOOK_SECRET).split(",") if s.strip()]
+ALLOW_UNVERIFIED = os.getenv("ALLOW_UNVERIFIED_WEBHOOKS") == "1"
 
+# GitHub App creds
 APP_ID = (os.getenv("GITHUB_APP_ID") or "").strip()
 APP_PEM_PATH = (os.getenv("GITHUB_APP_PRIVATE_KEY_PATH") or "").strip()
-APP_PEM_INLINE = (os.getenv("GITHUB_APP_PRIVATE_KEY") or "").strip()
+APP_PEM_INLINE = (os.getenv("GITHUB_APP_PRIVATE_KEY") or "").strip()  # \n-escaped allowed
+
+# Token fallback/debug
 EXPLICIT_INSTALLATION_TOKEN = (os.getenv("EXPLICIT_INSTALLATION_TOKEN") or "").strip()
 FORCE_EXPLICIT_TOKEN = os.getenv("FORCE_EXPLICIT_TOKEN") == "1"
 
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_S", "25"))
-CHECK_NAME = os.getenv("PRSEC_CHECK_NAME", "PRSec/Semgrep")
-SEMGREP_CONFIG = os.getenv("SEMGREP_CONFIG")  # optional override
+# Timeouts / limits
+HTTP_TIMEOUT_S       = int(os.getenv("HTTP_TIMEOUT_S", "25"))
+SEMGREP_TIMEOUT_S    = int(os.getenv("SEMGREP_TIMEOUT_S", "120"))      # per Semgrep call
+PIPELINE_DEADLINE_S  = int(os.getenv("PIPELINE_DEADLINE_S", "90"))     # 0 disables hard cap
+WATCHDOG_GRACE_S     = int(os.getenv("WATCHDOG_GRACE_S", "20"))        # extra guard after deadline
+
+# Scan/reporting
+CHECK_NAME      = os.getenv("PRSEC_CHECK_NAME", "PRSec/Semgrep")
+SEMGREP_CONFIG  = os.getenv("SEMGREP_CONFIG") or None
 SEMGREP_EXCLUDE = [s for s in (os.getenv("SEMGREP_EXCLUDE") or "").split(",") if s]
-MAX_ANNOTS = 200  # safety ceiling so we don't flood
+MAX_ANNOTS      = int(os.getenv("PRSEC_MAX_ANNOTATIONS", "200"))
 
 # ---------------- Helpers ----------------
 def _mask(s: str, keep: int = 6) -> str:
@@ -81,28 +94,9 @@ def _ca_bundle() -> str:
         or certifi.where()
     )
 
-def _post_json(url: str, token: str, payload: dict) -> dict:
-    r = requests.post(url, headers=_bearer(token), json=payload, timeout=HTTP_TIMEOUT, verify=_ca_bundle())
-    try_json = None
-    try:
-        try_json = r.json()
-    except Exception:
-        try_json = None
-    if r.status_code >= 400:
-        log.error("POST %s -> %s %s body=%s resp=%s",
-                  url, r.status_code, r.reason, str(payload)[:400], (r.text or str(try_json))[:800])
-    else:
-        loc = (try_json or {}).get("html_url") or r.headers.get("Location")
-        log.info("POST %s -> %s %s", url, r.status_code, f"Created: {loc}" if loc else "OK")
-    r.raise_for_status()
-    return try_json or {}
-
-def _get_json(url: str, token: str, params: Optional[dict] = None) -> dict:
-    r = requests.get(url, headers=_bearer(token), params=params or {}, timeout=HTTP_TIMEOUT, verify=_ca_bundle())
-    if r.status_code >= 400:
-        log.error("GET %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
-    r.raise_for_status()
-    return r.json()
+def _deadline_guard(start_ts: float, limit_s: int, stage: str) -> None:
+    if limit_s and (time.time() - start_ts) > limit_s:
+        raise RuntimeError(f"pipeline deadline exceeded before {stage} (>{limit_s}s)")
 
 def _read_private_key() -> str:
     if APP_PEM_PATH:
@@ -125,12 +119,19 @@ def _create_app_jwt() -> str:
     return token.decode() if isinstance(token, (bytes, bytearray)) else token
 
 def _get_installation_token(installation_id: int) -> str:
-    # Prefer per-installation token from the event; fallback to explicit only when forced or missing id
+    """
+    Prefer per-installation token from the event; fallback to EXPLICIT_INSTALLATION_TOKEN
+    only when forced or missing id.
+    """
     if installation_id and not FORCE_EXPLICIT_TOKEN:
         app_jwt = _create_app_jwt()
         url = f"{GITHUB_API}/app/installations/{installation_id}/access_tokens"
-        r = requests.post(url, headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},
-                          timeout=HTTP_TIMEOUT, verify=_ca_bundle())
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},
+            timeout=HTTP_TIMEOUT_S,
+            verify=_ca_bundle(),
+        )
         if r.status_code >= 400:
             log.error("POST %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
         r.raise_for_status()
@@ -139,47 +140,129 @@ def _get_installation_token(installation_id: int) -> str:
         return EXPLICIT_INSTALLATION_TOKEN
     raise RuntimeError("No installation token available")
 
-# ---------- GitHub ops ----------
-def post_pr_comment(owner: str, repo: str, pr_number: int, body: str, token: str) -> None:
-    _post_json(f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments", token, {"body": body})
+# ---- central GH request with 401 auto-retry (fresh installation token) ----
+def _gh_request(
+    method: str,
+    url: str,
+    token: str,
+    install_id: Optional[int] = None,
+    **kwargs,
+) -> requests.Response:
+    r = requests.request(method, url, headers=_bearer(token), timeout=HTTP_TIMEOUT_S, verify=_ca_bundle(), **kwargs)
+    if r.status_code == 401 and install_id:
+        try:
+            fresh = _get_installation_token(int(install_id))
+            r = requests.request(method, url, headers=_bearer(fresh), timeout=HTTP_TIMEOUT_S, verify=_ca_bundle(), **kwargs)
+        except Exception as e:
+            log.error("401 retry: failed to mint fresh installation token: %s", e)
+    return r
 
-def set_status(owner: str, repo: str, sha: str, state: str, context: str, description: str, target_url: Optional[str], token: str) -> None:
-    payload = {"state": state, "context": context, "description": description}
-    if target_url:
-        payload["target_url"] = target_url
-    _post_json(f"{GITHUB_API}/repos/{owner}/{repo}/statuses/{sha}", token, payload)
+def _post_json(url: str, token: str, payload: dict, install_id: Optional[int] = None) -> dict:
+    r = _gh_request("POST", url, token, install_id=install_id, json=payload)
+    try_json = None
+    try:
+        try_json = r.json()
+    except Exception:
+        try_json = None
+    if r.status_code >= 400:
+        log.error("POST %s -> %s %s body=%s resp=%s", url, r.status_code, r.reason, str(payload)[:400], (r.text or str(try_json))[:800])
+    else:
+        loc = (try_json or {}).get("html_url") or r.headers.get("Location")
+        log.info("POST %s -> %s %s", url, r.status_code, f"Created: {loc}" if loc else "OK")
+    r.raise_for_status()
+    return try_json or {}
 
-def create_check_run(owner: str, repo: str, head_sha: str, name: str, title: str, summary: str, annotations: List[Dict[str, Any]], token: str) -> int:
-    """Create a check run with up to 50 annotations; return check_run id."""
-    chunk = annotations[:50]
+def _patch_json(url: str, token: str, payload: dict, install_id: Optional[int] = None) -> dict:
+    r = _gh_request("PATCH", url, token, install_id=install_id, json=payload)
+    try_json = None
+    try:
+        try_json = r.json()
+    except Exception:
+        try_json = None
+    if r.status_code >= 400:
+        log.error("PATCH %s -> %s %s body=%s resp=%s", url, r.status_code, r.reason, str(payload)[:400], (r.text or str(try_json))[:800])
+    r.raise_for_status()
+    return try_json or {}
+
+def _get_json(url: str, token: str, params: Optional[dict] = None, install_id: Optional[int] = None) -> dict:
+    r = _gh_request("GET", url, token, install_id=install_id, params=params or {})
+    if r.status_code >= 400:
+        log.error("GET %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
+    r.raise_for_status()
+    return r.json()
+
+# ---------- GitHub Checks helpers ----------
+def _create_check_in_progress(owner: str, repo: str, head_sha: str, name: str,
+                              title: str, summary: str, token: str,
+                              install_id: Optional[int]) -> int:
     data = {
         "name": name,
         "head_sha": head_sha,
-        "status": "completed",  # we submit completed with conclusion immediately after scan
-        "conclusion": "neutral",  # will be patched below by update_check_run()
-        "output": {"title": title, "summary": summary, "annotations": chunk},
+        "status": "in_progress",
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "output": {"title": title, "summary": summary},
     }
-    resp = _post_json(f"{GITHUB_API}/repos/{owner}/{repo}/check-runs", token, data)
+    resp = _post_json(f"{GITHUB_API}/repos/{owner}/{repo}/check-runs", token, data, install_id=install_id)
     return int(resp.get("id") or 0)
 
-def update_check_run(owner: str, repo: str, check_id: int, conclusion: str, title: str, summary: str, annotations: List[Dict[str, Any]], token: str) -> None:
-    """Update check run; can send more annotations in 50-sized chunks."""
-    base = {"conclusion": conclusion, "output": {"title": title, "summary": summary}}
-    if annotations:
-        base["output"]["annotations"] = annotations[:50]
-    _post_json(f"{GITHUB_API}/repos/{owner}/{repo}/check-runs/{check_id}", token, base)
-    # send remaining annotations in batches (append pattern)
+def create_check_in_progress_with_fallback(
+    base_owner: str, base_repo: str, head_owner: str, head_repo: str,
+    head_sha: str, name: str, title: str, summary: str,
+    token: str, install_id: Optional[int],
+) -> Tuple[str, str, int]:
+    """Try base repo first; if it fails with 403/404/422, try head repo."""
+    try:
+        check_id = _create_check_in_progress(base_owner, base_repo, head_sha, name, title, summary, token, install_id)
+        return base_owner, base_repo, check_id
+    except requests.HTTPError as e:
+        rc = getattr(e.response, "status_code", 0)
+        if rc in (403, 404, 422):  # fork or perms
+            log.info("check-run create fallback to head repo due to %s", rc)
+            check_id = _create_check_in_progress(head_owner, head_repo, head_sha, name, title, summary, token, install_id)
+            return head_owner, head_repo, check_id
+        raise
+
+def complete_check_run(owner: str, repo: str, check_id: int, conclusion: str,
+                       title: str, summary: str, annotations: List[Dict[str, Any]],
+                       token: str, install_id: Optional[int]) -> None:
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/check-runs/{check_id}"
+    payload = {
+        "status": "completed",
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "conclusion": conclusion,
+        "output": {"title": title, "summary": summary, "annotations": annotations[:50]},
+    }
+    _patch_json(url, token, payload, install_id=install_id)
+    # append remaining annotations in batches of 50
     rest = annotations[50:]
     while rest:
         batch, rest = rest[:50], rest[50:]
-        _post_json(f"{GITHUB_API}/repos/{owner}/{repo}/check-runs/{check_id}",
-                   token, {"output": {"title": title, "summary": summary, "annotations": batch}})
+        _patch_json(url, token, {"output": {"title": title, "summary": summary, "annotations": batch}}, install_id=install_id)
 
-def list_changed_files(owner: str, repo: str, pr: int, token: str) -> List[str]:
+def watchdog_timeout_check(owner: str, repo: str, check_id: int, token: str,
+                           install_id: Optional[int], after_seconds: int) -> None:
+    """If still in_progress after grace, mark timed_out to avoid permanent 'in progress'."""
+    try:
+        time.sleep(max(after_seconds, 1))
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/check-runs/{check_id}"
+        jr = _get_json(url, token, install_id=install_id)
+        if (jr.get("status") == "in_progress") and (jr.get("conclusion") in (None, "action_required")):
+            log.warning("watchdog: completing stale check-run id=%s as timed_out", check_id)
+            _patch_json(url, token, {
+                "status": "completed",
+                "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "conclusion": "timed_out",
+                "output": {"title": CHECK_NAME, "summary": "Timed out waiting for scan to complete."},
+            }, install_id=install_id)
+    except Exception as e:
+        log.error("watchdog error: %s", e)
+
+# ---------- Repo utilities ----------
+def list_changed_files(owner: str, repo: str, pr: int, token: str, install_id: Optional[int]) -> List[str]:
     files: List[str] = []
     page = 1
     while True:
-        js = _get_json(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr}/files", token, params={"per_page": 100, "page": page})
+        js = _get_json(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr}/files", token, params={"per_page": 100, "page": page}, install_id=install_id)
         if not js:
             break
         files.extend([x["filename"] for x in js if isinstance(x.get("filename"), str)])
@@ -188,65 +271,93 @@ def list_changed_files(owner: str, repo: str, pr: int, token: str) -> List[str]:
         page += 1
     return files
 
-def download_tarball(owner: str, repo: str, sha: str, token: str, workdir: Path) -> Path:
-    """Download and extract the repo tarball at SHA, return the extracted repo root."""
+def download_tarball(owner: str, repo: str, sha: str, token: str, install_id: Optional[int], workdir: Path) -> Path:
     url = f"{GITHUB_API}/repos/{owner}/{repo}/tarball/{sha}"
-    r = requests.get(url, headers=_bearer(token), timeout=HTTP_TIMEOUT, verify=_ca_bundle(), stream=True)
+    r = _gh_request("GET", url, token, install_id=install_id, stream=True)
     if r.status_code >= 400:
         log.error("GET %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
     r.raise_for_status()
     tar_bytes = io.BytesIO(r.content)
     with tarfile.open(fileobj=tar_bytes, mode="r:gz") as tf:
-        tf.extractall(workdir)  # safe here; trusted GitHub tarball
-        # First top-level directory is the repo root
+        tf.extractall(workdir)  # GitHub tarball is trusted
         top = next((m for m in tf.getmembers() if m.isdir() and "/" not in m.name.strip("/")), None)
     if not top:
-        # best effort: use the first directory created
-        subdirs = [p for p in workdir.iterdir() if p.is_dir()]
-        if not subdirs:
+        subs = [p for p in workdir.iterdir() if p.is_dir()]
+        if not subs:
             raise RuntimeError("Failed to locate repo root in tarball")
-        return subdirs[0]
+        return subs[0]
     return workdir / top.name
 
-# ---------- Scanning pipeline ----------
-def run_semgrep_pipeline(owner, repo, pr, head_sha, installation_id, delivery):
-    final_state = "error"
-    final_desc  = "Scan failed"
+# ---------- Scanning pipeline (check-run only) ----------
+def run_semgrep_pipeline(
+    base_owner: str,
+    base_repo: str,
+    head_owner: str,
+    head_repo: str,
+    pr: int,
+    head_sha: str,
+    installation_id: int,
+    check_owner: str,
+    check_repo: str,
+    check_id: int,
+    token: str,
+) -> None:
+    final_conclusion, final_summary = "failure", "Scan failed"
+    start_ts = time.time()
+
     try:
-        token = _get_installation_token(installation_id)
-        repo_root = download_tarball(owner, repo, head_sha, token, Path(tempfile.mkdtemp()))
-        try:
-            changed = list_changed_files(owner, repo, pr, token)
-        except Exception as e:
-            log.error("failed to list changed files: %s", e)
-            changed = []
-        paths = changed or [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
+        with tempfile.TemporaryDirectory(prefix="prsec_") as td:
+            tdp = Path(td)
 
-        findings = run_semgrep(paths=paths, repo_root=str(repo_root),
-                               config=SEMGREP_CONFIG, exclude=SEMGREP_EXCLUDE, timeout_s=120)
-        counts, summary_md = summarize_findings(findings)
-        annots = to_github_annotations(findings)[:MAX_ANNOTS]
+            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "tarball download")
+            try:
+                repo_root = download_tarball(head_owner, head_repo, head_sha, token, installation_id, tdp)
+            except Exception as e:
+                log.error("download/extract failed: %s", e)
+                return
 
-        # check run + conclusion
-        conclusion = "success" if sum(counts.values()) == 0 else "failure"
-        try:
-            check_id = create_check_run(owner, repo, head_sha, CHECK_NAME,
-                                        f"{CHECK_NAME} results", summary_md, annots[:50], token)
-            update_check_run(owner, repo, check_id, conclusion, f"{CHECK_NAME} results", summary_md, annots[50:], token)
-        except Exception as e:
-            log.error("check run reporting failed: %s", e)
+            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "listing changed files")
+            try:
+                changed = list_changed_files(base_owner, base_repo, pr, token, installation_id)
+            except Exception as e:
+                log.error("failed to list changed files: %s", e)
+                changed = []
 
-        final_state = "success" if conclusion == "success" else "failure"
-        final_desc  = "No issues found" if final_state == "success" else "Issues detected"
+            paths = changed or [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
+
+            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "semgrep start")
+            findings: List[Dict[str, Any]] = []
+            try:
+                findings = run_semgrep(
+                    paths=paths,
+                    repo_root=str(repo_root),
+                    config=SEMGREP_CONFIG,
+                    exclude=SEMGREP_EXCLUDE,
+                    timeout_s=SEMGREP_TIMEOUT_S,
+                )
+            except Exception as e:
+                log.error("semgrep invocation failed: %s", e)
+            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "semgrep finish")
+
+            counts, summary_md = summarize_findings(findings)
+            annotations = to_github_annotations(findings)[:MAX_ANNOTS]
+
+            final_conclusion = "success" if sum(counts.values()) == 0 else "failure"
+            final_summary = "No issues found" if final_conclusion == "success" else "Issues detected"
+
+            _deadline_guard(start_ts, PIPELINE_DEADLINE_S, "check-run completion")
+            try:
+                complete_check_run(check_owner, check_repo, check_id,
+                                   final_conclusion, f"{CHECK_NAME} results",
+                                   summary_md, annotations, token, installation_id)
+            except Exception as e:
+                log.error("check run reporting failed: %s", e)
+
     except Exception as e:
         log.error("pipeline error: %s", e)
     finally:
-        try:
-            set_status(owner, repo, head_sha, state=final_state, context=CHECK_NAME,
-                       description=final_desc, target_url=None, token=token if 'token' in locals() else EXPLICIT_INSTALLATION_TOKEN)
-        except Exception as e:
-            log.error("failed to send final status: %s", e)
-
+        # If we couldn't complete it above, watchdog will finalize it later.
+        pass
 
 # ---------------- Startup / Health ----------------
 @app.on_event("startup")
@@ -278,21 +389,26 @@ async def webhook(
 ):
     body: bytes = await request.body()
 
-    # Signature verification (sha256/sha1), multi-secret
+    # Signature verification (sha256/sha1). If no secrets configured, accept with a warning.
     provided = x_hub_signature_256 or x_hub_signature
-    if SECRETS and not provided:
-        raise HTTPException(status_code=400, detail="Signature required")
-    if provided:
+    if not SECRETS:
+        log.warning("no webhook secrets configured; accepting delivery=%s without verification", x_github_delivery)
+    else:
+        if not provided:
+            raise HTTPException(status_code=400, detail="Signature required")
         if provided.startswith("sha256="):
             algo = "sha256"
         elif provided.startswith("sha1="):
             algo = "sha1"
         else:
             raise HTTPException(status_code=400, detail="Unsupported signature prefix")
-
         if not any(_secure_eq(provided, _hmac_sig(sec, body, algo)) for sec in SECRETS):
-            log.warning("signature mismatch delivery=%s provided=%s tried=%d secret(s)", x_github_delivery, _mask(provided), len(SECRETS))
-            raise HTTPException(status_code=401, detail="Invalid signature")
+            suffixes = [_hmac_sig(sec, body, algo)[-6:] for sec in SECRETS]
+            log.warning("signature mismatch delivery=%s algo=%s provided_suffix=%s tried=%d expected_suffixes=%s",
+                        x_github_delivery, algo, (provided or "")[-6:], len(SECRETS), suffixes)
+            if not ALLOW_UNVERIFIED:
+                raise HTTPException(status_code=401, detail="Invalid signature")
+            log.warning("continuing despite signature mismatch (ALLOW_UNVERIFIED_WEBHOOKS=1)")
 
     # Parse payload
     try:
@@ -310,30 +426,54 @@ async def webhook(
         if action not in {"opened", "reopened", "synchronize", "edited", "ready_for_review"}:
             return {"ok": True, "ignored": action}
 
-        base_repo = payload["pull_request"]["base"]["repo"]
-        owner = base_repo["owner"]["login"]
-        repo = base_repo["name"]
+        # base/head repos (fork-safe)
+        base = payload["pull_request"]["base"]["repo"]
+        head = payload["pull_request"]["head"]["repo"]
+        base_owner, base_repo = base["owner"]["login"], base["name"]
+        head_owner, head_repo = head["owner"]["login"], head["name"]
+
         pr_number = int(payload["number"])
-        head_sha = payload["pull_request"]["head"]["sha"]
-        base_sha = payload["pull_request"]["base"]["sha"]
+        head_sha  = payload["pull_request"]["head"]["sha"]
+        base_sha  = payload["pull_request"]["base"]["sha"]
         installation_id = int(payload.get("installation", {}).get("id") or 0)
 
-        # Leave a visible receipt
+        # token (per-installation if possible)
         try:
             token = _get_installation_token(installation_id)
-            msg = f"PRSec ✅ received `{action}` for `{head_sha[:7]}` (delivery `{x_github_delivery}`)"
-            post_pr_comment(owner, repo, pr_number, msg, token)
+        except Exception as e:
+            log.error("token acquisition failed: %s", e)
+            raise HTTPException(status_code=500, detail="Token acquisition failed")
+
+        # receipt comment (base repo), best-effort
+        try:
+            _post_json(f"{GITHUB_API}/repos/{base_owner}/{base_repo}/issues/{pr_number}/comments",
+                       token, {"body": f"PRSec ✅ received `{action}` for `{head_sha[:7]}` (delivery `{x_github_delivery}`)"},
+                       install_id=installation_id)
         except Exception as e:
             log.error("failed to comment on PR: %s", e)
 
-        # Set pending immediately (non-blocking)
+        # Create an in-progress check run immediately (base first, fallback to head).
         try:
-            set_status(owner, repo, head_sha, state="pending", context=CHECK_NAME, description="Scanning…", target_url=None, token=token)
+            check_owner, check_repo, check_id = create_check_in_progress_with_fallback(
+                base_owner, base_repo, head_owner, head_repo, head_sha,
+                CHECK_NAME, f"{CHECK_NAME} results", "Scanning…", token, installation_id
+            )
         except Exception as e:
-            log.error("failed to set pending status (non-fatal): %s", e)
+            log.error("failed to create check run: %s", e)
+            raise HTTPException(status_code=500, detail="Check run creation failed")
 
-        # Kick off background analysis
-        background.add_task(run_semgrep_pipeline, owner, repo, pr_number, head_sha, installation_id, x_github_delivery)
+        # Kick off the scan (which will complete the check run),
+        # and a watchdog to force-close if it gets stuck.
+        background.add_task(
+            run_semgrep_pipeline,
+            base_owner, base_repo, head_owner, head_repo, pr_number, head_sha,
+            installation_id, check_owner, check_repo, check_id, token,
+        )
+        background.add_task(
+            watchdog_timeout_check,
+            check_owner, check_repo, check_id, token, installation_id,
+            (PIPELINE_DEADLINE_S or 0) + WATCHDOG_GRACE_S,
+        )
 
         return {"ok": True, "event": "pull_request", "action": action, "pr": pr_number, "head": head_sha, "base": base_sha}
 

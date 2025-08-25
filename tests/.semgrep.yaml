@@ -1,3 +1,66 @@
-imports:
+configs:
   - p/security-audit
   - p/python
+  - p/bandit
+rules:
+  - id: py-weak-md5
+    message: Use of weak hash (md5)
+    severity: ERROR
+    languages: [python]
+    pattern: hashlib.md5(...)
+
+  - id: py-unsafe-yaml-load
+    message: yaml.load without an explicit Safe/FullLoader
+    severity: ERROR
+    languages: [python]
+    pattern: yaml.load(...)
+
+  - id: py-insecure-deserialization-pickle
+    message: Insecure deserialization via pickle.loads
+    severity: ERROR
+    languages: [python]
+    pattern: pickle.loads(...)
+
+  - id: py-shell-true-subprocess
+    message: Possible shell injection: subprocess.* with shell=True
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: subprocess.$F(..., shell=True, ...)
+      - metavariable-pattern:
+          metavariable: $F
+          pattern-either:
+            - pattern: check_output
+            - pattern: run
+            - pattern: Popen
+            - pattern: call
+
+  - id: py-dangerous-eval
+    message: Dangerous use of eval()
+    severity: ERROR
+    languages: [python]
+    pattern: eval(...)
+
+  - id: py-requests-disable-verify
+    message: TLS cert verification disabled
+    severity: ERROR
+    languages: [python]
+    pattern: requests.$F(..., verify=False, ...)
+
+  - id: py-tempfile-mktemp
+    message: tempfile.mktemp() is insecure; use NamedTemporaryFile/mkstemp
+    severity: WARNING
+    languages: [python]
+    pattern: tempfile.mktemp(...)
+
+  - id: py-random-for-secrets
+    message: random.random() is not cryptographic; use secrets or os.urandom
+    severity: WARNING
+    languages: [python]
+    pattern: random.random(...)
+
+  - id: py-tarfile-extractall
+    message: tarfile.extractall() may allow path traversal; validate members
+    severity: WARNING
+    languages: [python]
+    pattern: tarfile.extractall(...)

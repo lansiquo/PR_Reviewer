@@ -1,11 +1,8 @@
-#### app.py
-<<<<<<< HEAD
 """
 BEGINNER-FRIENDLY WALKTHROUGH COMMENTS
 =====================================
 This file defines a tiny web service (using FastAPI) that listens for GitHub
 webhooks on the "/webhook" endpoint. When a Pull Request (PR) event arrives,
-we:
   1) Verify the webhook signature (to ensure the request is really from GitHub).
   2) Parse the JSON payload to learn which repo/PR/commit is involved.
   3) Acquire a GitHub token for the installation of this GitHub App.
@@ -26,22 +23,8 @@ Notes for non-coders:
 - "Check Run" = the little status lines you see on a PR (e.g., checks passing).
 - "Semgrep" = a tool that scans code for possible security or quality issues.
 - "tarball" = a compressed bundle of files. GitHub can give us one for a commit.
-
-
-Notes for non-coders:
-- A *function* is a named block of code that performs a job. We add short
-  docstrings ("what this does") and inline comments ("why/how") to explain.
-- "env var" (environment variable) = a setting provided from the outside,
-  like a secret or a timeout. This keeps secrets out of code.
-- "token" = a temporary key we use to call GitHub's API as our GitHub App.
-- "Check Run" = the little status lines you see on a PR (e.g., checks passing).
-- "Semgrep" = a tool that scans code for possible security or quality issues.
-- "tarball" = a compressed bundle of files. GitHub can give us one for a commit.
 """
 
-
-=======
->>>>>>> 6154cfc (commit for change)
 import os
 import io
 import json

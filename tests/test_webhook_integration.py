@@ -81,7 +81,7 @@ def test_pull_request_flow_integration():
         except Exception:
             expected_head = expected_base = None  # fall back to hex-only checks
 
-    resp = client.post("/webhook", data=body, headers=headers)
+    resp = client.post("/webhook", content=body, headers=headers)
     assert resp.status_code == 200, resp.text
     j = resp.json()
     assert j["ok"] is True

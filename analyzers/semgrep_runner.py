@@ -17,6 +17,7 @@ class SemgrepInvocationError(Exception):
     cmd: List[str]
     stdout: str
     stderr: str
+
     def __str__(self) -> str:
         return _fmt_semgrep_error(self.cmd, self.exit_code, self.stderr)
 
@@ -79,19 +80,21 @@ def run_semgrep(
         cmd += chunk
 
         try:
+            # Enforce a real wall-clock timeout in addition to Semgrep's own --timeout.
             proc = subprocess.run(
                 cmd,
                 cwd=repo_root,
                 text=True,
                 capture_output=True,
                 check=False,  # we handle rc
+                timeout=timeout_s + 5,  # small buffer around Semgrep's internal timeout
             )
         except subprocess.TimeoutExpired as e:
             raise SemgrepInvocationError(
                 exit_code=124,
                 cmd=cmd,
-                stdout="",
-                stderr=f"Semgrep timed out after {timeout_s}s: {e}",
+                stdout=e.stdout or "",
+                stderr=f"Semgrep timed out after {timeout_s}s: {e.stderr or ''}",
             )
 
         rc = proc.returncode
@@ -138,15 +141,18 @@ def to_github_annotations(
         if f.get("fix"):
             meta.append(f"Suggested fix: {f['fix']}")
 
-        out.append({
+        annotation: Dict[str, Any] = {
             "path": path,
             "start_line": int(f["start_line"]),
             "end_line": int(f["end_line"]),
             "annotation_level": level,       # failure | warning | notice
             "title": title,
             "message": f.get("message") or title,
-            "raw_details": "\n".join(meta) or None,
-        })
+        }
+        if meta:
+            annotation["raw_details"] = "\n".join(meta)
+        out.append(annotation)
+
     return out
 
 
@@ -228,9 +234,21 @@ def _normalize_results(results: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, 
         sev = _normalize_severity(meta.get("severity") or extra.get("severity") or "LOW")
 
         # Optional metadata
-        cwe = meta.get("cwe") or meta.get("cwe_id") or meta.get("cwe_id_vuln")
-        cwe = cwe if isinstance(cwe, str) else None
-        owasp = meta.get("owasp") if isinstance(meta.get("owasp"), str) else None
+        cwe_val = meta.get("cwe") or meta.get("cwe_id") or meta.get("cwe_id_vuln")
+        if isinstance(cwe_val, list):
+            cwe = ", ".join(map(str, cwe_val))
+        elif isinstance(cwe_val, str):
+            cwe = cwe_val
+        else:
+            cwe = None
+
+        owasp_val = meta.get("owasp") or meta.get("owasp_category")
+        if isinstance(owasp_val, list):
+            owasp = ", ".join(map(str, owasp_val))
+        elif isinstance(owasp_val, str):
+            owasp = owasp_val
+        else:
+            owasp = None
 
         title = extra.get("message") or r.get("check_id") or "Semgrep finding"
 
@@ -268,10 +286,30 @@ def _normalize_severity(s: str) -> str:
         return "CRITICAL"
     if s in {"ERROR"}:
         return "HIGH"
-    if s in {"WARNING"}:
+    if s in {"WARNING", "WARN"}:
         return "MEDIUM"
     # INFO/UNKNOWN → LOW
     return "LOW"
+
+
+def _severity_floor(raw: Optional[str]) -> Optional[str]:
+    """
+    Normalize a minimum-severity filter from env.
+
+    Accepts common synonyms:
+      - NONE/OFF/DISABLE => no filter
+      - CRITICAL/HIGH/MEDIUM/LOW (case-insensitive)
+      - INFO => LOW
+      - WARN/ WARNING => MEDIUM
+      - ERROR => HIGH
+      - BLOCKER => CRITICAL
+    """
+    if raw is None:
+        return None
+    val = (raw or "").strip().upper()
+    if val in {"", "NONE", "OFF", "DISABLE"}:
+        return None
+    return _normalize_severity(val)
 
 
 def _severity_to_annotation_level(sev: str) -> str:

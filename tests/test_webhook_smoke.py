@@ -74,7 +74,7 @@ def test_webhook_smoke(monkeypatch):
         "Content-Type": "application/json",
     }
 
-    resp = client.post("/webhook", data=body, headers=headers)
+    resp = client.post("/webhook", content=body, headers=headers)
     assert resp.status_code == 200, resp.text
     j = resp.json()
     assert j["ok"] is True

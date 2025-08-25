@@ -8,3 +8,4 @@ python-dotenv
 semgrep
 pytest
 httpx
+certifi>=2024.2.2

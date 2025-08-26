@@ -1,3 +1,6 @@
 private-key.pem
 # ignore real env files
 .env
+__pycache__
+.__pycache__
+tests/__pycache__

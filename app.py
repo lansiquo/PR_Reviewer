@@ -95,6 +95,10 @@ SEMGREP_CONFIG  = os.getenv("SEMGREP_CONFIG") or None
 SEMGREP_EXCLUDE = [s for s in (os.getenv("SEMGREP_EXCLUDE") or "").split(",") if s]
 MAX_ANNOTS      = int(os.getenv("PRSEC_MAX_ANNOTATIONS", "200"))
 
+# Optional scope controls (opt-in, zero surprises)
+INCLUDE_ALL_PY = os.getenv("PRSEC_INCLUDE_ALL_PY", "0") == "1"  # if 1, also scan repo-wide *.py
+ALWAYS_INCLUDE_GLOBS = [s.strip() for s in (os.getenv("PRSEC_ALWAYS_INCLUDE_GLOBS", "")).split(",") if s.strip()]
+
 # New: sentinel for demo/seed files that should always be flagged
 PRSEC_FLAG_BAD_FILE = os.getenv("PRSEC_FLAG_BAD_FILE", "1") == "1"
 PRSEC_BAD_FILE_NAMES = [s.strip() for s in (os.getenv("PRSEC_BAD_FILE_NAMES", "bad.py")).split(",") if s.strip()]
@@ -346,6 +350,17 @@ def _find_bad_files(repo_root: Path, candidates: List[str]) -> List[str]:
                     hits.append(rel)
     return hits
 
+# Expand ALWAYS_INCLUDE_GLOBS patterns relative to repo root
+def _expand_globs(repo_root: Path, patterns: List[str]) -> List[str]:
+    hits: List[str] = []
+    for pat in patterns:
+        if not pat:
+            continue
+        for p in repo_root.glob(pat):
+            if p.is_file():
+                hits.append(str(p.relative_to(repo_root)))
+    return hits
+
 
 # ---------- Scanning pipeline (check-run only) ----------
 
@@ -419,6 +434,26 @@ def run_semgrep_pipeline(
             existing = [p for p in paths if (repo_root / p).exists()]
             if not existing:
                 existing = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
+
+            # --- Scope controls ---
+            # 1) Always-include specific globs (e.g., "app.py,analyzers/**/*.py")
+            if ALWAYS_INCLUDE_GLOBS:
+                extra = _expand_globs(repo_root, ALWAYS_INCLUDE_GLOBS)
+                for e in extra:
+                    if e not in existing and (repo_root / e).exists():
+                        existing.append(e)
+
+            # 2) Optionally include all Python sources in the repo for full coverage
+            if INCLUDE_ALL_PY:
+                all_py = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
+                for e in all_py:
+                    if e not in existing:
+                        existing.append(e)
+
+            log.info("scan file set size=%d (changed=%d, extras=%d, all_py=%s)",
+                     len(existing), len(changed),
+                     len([1 for _ in ALWAYS_INCLUDE_GLOBS]) if ALWAYS_INCLUDE_GLOBS else 0,
+                     str(INCLUDE_ALL_PY))
 
             # 5) Guaranteed inclusion of demo/seed files (bad.py etc.)
             present_bad: List[str] = []

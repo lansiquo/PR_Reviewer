@@ -2,6 +2,7 @@
 # # bad.py
 # Intentionally-insecure snippets for Semgrep testing. (touched to trigger scan)
 # Do NOT import or run in production.
+##
 
 
 import subprocess
@@ -18,7 +19,6 @@ import subprocess
 def f(user):
     eval("1+1")                          # unsafe eval
     subprocess.run("ls " + user, shell=True)  # shell=True
-
 
 
 def demo(user_input: str, user_cmd: str, data: str, blob: bytes, tar_path: str):

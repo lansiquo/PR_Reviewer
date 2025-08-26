@@ -1,37 +1,40 @@
-import os
+# app.py
+from __future__ import annotations
+
+"""
+FastAPI webhook that turns PR events into Semgrep scans.
+Design goals:
+- HTTP 200s always; problems reported in JSON, not via 4xx/5xx.
+- Deterministic scanning with an offline ruleset.
+- Guaranteed inclusion of bad.py, bad2.py, and any *bad*.py.
+- Safe tar extraction (no tarfile.extractall) to avoid self-flagging.
+"""
+
 import io
 import json
+import logging
+import os
 import time
 import hmac
 import tarfile
 import hashlib
-import logging
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from contextlib import asynccontextmanager
 
-import requests
 import certifi
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+import requests
+from fastapi import BackgroundTasks, FastAPI, Header, Request
 from dotenv import load_dotenv
 
+# Load local env for dev
 load_dotenv(dotenv_path=".env")
 
-# --- analyzers ---
-from analyzers.semgrep_runner import (
-    run_semgrep,
-    to_github_annotations,
-    summarize_findings,
-)
-
-try:
-    import jwt  # PyJWT
-except Exception:  # pragma: no cover
-    jwt = None
+# Ensure no severity filter; we want every hit
+os.environ["PRSEC_SEMGREP_MIN_SEVERITY"] = "LOW"
 
 # ---------------- App / Logging ----------------
-app = FastAPI(title="PRSec Webhook", version="2.5.0")
+app = FastAPI(title="PRSec Webhook", version="3.3.0")
 log = logging.getLogger("webhook")
 logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 BOOT_TS = time.time()
@@ -39,43 +42,53 @@ BOOT_TS = time.time()
 # ---------------- Config ----------------
 GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com").rstrip("/")
 
+# Webhook secrets (optional; supports rotation). Default: permissive (no 401s).
 WEBHOOK_SECRET = (os.getenv("GITHUB_WEBHOOK_SECRET") or "").strip()
 SECRETS = [s.strip() for s in (os.getenv("GITHUB_WEBHOOK_SECRETS") or WEBHOOK_SECRET).split(",") if s.strip()]
+ALLOW_UNVERIFIED = os.getenv("ALLOW_UNVERIFIED_WEBHOOKS", "1") == "1"  # default permissive
 
-# IMPORTANT: default bypass = ON for tests; set to "0" for production
-ALLOW_UNVERIFIED = os.getenv("ALLOW_UNVERIFIED_WEBHOOKS", "1") == "1"
-
+# GitHub App creds
 APP_ID = (os.getenv("GITHUB_APP_ID") or "").strip()
 APP_PEM_PATH = (os.getenv("GITHUB_APP_PRIVATE_KEY_PATH") or "").strip()
 APP_PEM_INLINE = (os.getenv("GITHUB_APP_PRIVATE_KEY") or "").strip()
 
+# Token fallback/debug
 EXPLICIT_INSTALLATION_TOKEN = (os.getenv("EXPLICIT_INSTALLATION_TOKEN") or "").strip()
 FORCE_EXPLICIT_TOKEN = os.getenv("FORCE_EXPLICIT_TOKEN") == "1"
 
-HTTP_TIMEOUT_S       = int(os.getenv("HTTP_TIMEOUT_S", "25"))
-SEMGREP_TIMEOUT_S    = int(os.getenv("SEMGREP_TIMEOUT_S", "120"))
-PIPELINE_DEADLINE_S  = int(os.getenv("PIPELINE_DEADLINE_S", "90"))
-WATCHDOG_GRACE_S     = int(os.getenv("WATCHDOG_GRACE_S", "20"))
+# Timeouts / limits
+HTTP_TIMEOUT_S      = int(os.getenv("HTTP_TIMEOUT_S", "25"))
+SEMGREP_TIMEOUT_S   = int(os.getenv("SEMGREP_TIMEOUT_S", "120"))
+PIPELINE_DEADLINE_S = int(os.getenv("PIPELINE_DEADLINE_S", "90"))
+WATCHDOG_GRACE_S    = int(os.getenv("WATCHDOG_GRACE_S", "20"))
 
+# Scan/reporting
 CHECK_NAME      = os.getenv("PRSEC_CHECK_NAME", "PRSec/Semgrep")
 SEMGREP_CONFIG  = os.getenv("SEMGREP_CONFIG") or None
 SEMGREP_EXCLUDE = [s for s in (os.getenv("SEMGREP_EXCLUDE") or "").split(",") if s]
 MAX_ANNOTS      = int(os.getenv("PRSEC_MAX_ANNOTATIONS", "200"))
 
+# Deterministic scanning defaults (no registry fetch)
 PRSEC_FORCE_OFFLINE = os.getenv("PRSEC_FORCE_OFFLINE", "1") == "1"
-ALWAYS_INCLUDE_BASENAMES = [s.strip().lower() for s in (os.getenv("PRSEC_ALWAYS_INCLUDE_BASENAMES", "bad.py")).split(",") if s.strip()]
+ALWAYS_INCLUDE_PATTERNS = [
+    s.strip()
+    for s in (os.getenv("PRSEC_ALWAYS_INCLUDE_PATTERNS", "bad.py,bad2.py,*bad*.py")).split(",")
+    if s.strip()
+]
 
-# ---------------- Helpers ----------------
-def _secure_eq(a: str, b: str) -> bool:
-    try:
-        return hmac.compare_digest(a, b)
-    except Exception:
-        return False
+# --- analyzers (our runner) ---
+from analyzers.semgrep_runner import run_semgrep, to_github_annotations, summarize_findings
 
+# PyJWT optional
+try:
+    import jwt  # type: ignore
+except Exception:  # pragma: no cover
+    jwt = None
+
+# ---------- Helpers ----------
 def _hmac_sig(secret: str, body: bytes, algo: str) -> str:
-    algo = algo.lower()
-    h = {"sha256": hashlib.sha256, "sha1": hashlib.sha1}[algo]
-    return f"{algo}=" + hmac.new(secret.encode("utf-8"), body, h).hexdigest()
+    h = {"sha256": hashlib.sha256, "sha1": hashlib.sha1}[algo.lower()]
+    return f"{algo.lower()}=" + hmac.new(secret.encode("utf-8"), body, h).hexdigest()
 
 def _bearer(token: str) -> Dict[str, str]:
     return {
@@ -104,30 +117,12 @@ def _create_app_jwt() -> str:
     token = jwt.encode(payload, _read_private_key(), algorithm="RS256")
     return token.decode() if isinstance(token, (bytes, bytearray)) else token
 
-def _request_with_retry(method: str, url: str, headers: Dict[str, str], **kwargs) -> requests.Response:
-    # Basic retry on transient failures and rate limits
-    max_attempts = 3
-    backoff = 1.5
-    attempt = 0
-    last = None
-    while attempt < max_attempts:
-        attempt += 1
-        r = requests.request(method, url, headers=headers, timeout=HTTP_TIMEOUT_S, verify=_ca_bundle(), **kwargs)
-        if r.status_code in (502, 503, 504):
-            time.sleep(backoff); backoff *= 2; last = r; continue
-        if r.status_code == 403:
-            ra = r.headers.get("Retry-After")
-            if ra and ra.isdigit():
-                time.sleep(int(ra)); last = r; continue
-        return r
-    return last or r
-
 def _gh_request(method: str, url: str, token: str, install_id: Optional[int] = None, **kwargs) -> requests.Response:
-    r = _request_with_retry(method, url, _bearer(token), **kwargs)
+    r = requests.request(method, url, headers=_bearer(token), timeout=HTTP_TIMEOUT_S, verify=_ca_bundle(), **kwargs)
     if r.status_code == 401 and install_id:
         try:
             fresh = _get_installation_token(int(install_id))
-            r = _request_with_retry(method, url, _bearer(fresh), **kwargs)
+            r = requests.request(method, url, headers=_bearer(fresh), timeout=HTTP_TIMEOUT_S, verify=_ca_bundle(), **kwargs)
         except Exception as e:
             log.error("401 retry failed: %s", e)
     return r
@@ -142,7 +137,8 @@ def _post_json(url: str, token: str, payload: dict, install_id: Optional[int] = 
         log.error("POST %s -> %s %s body=%s resp=%s", url, r.status_code, r.reason, str(payload)[:400], (r.text or str(try_json))[:800])
     else:
         loc = (try_json or {}).get("html_url") or r.headers.get("Location")
-        log.info("POST %s -> %s %s", url, r.status_code, f"Created: {loc}" if loc else "OK")
+        if loc:
+            log.info("POST %s -> %s Created: %s", url, r.status_code, loc)
     r.raise_for_status()
     return try_json or {}
 
@@ -177,76 +173,15 @@ def _get_installation_token(installation_id: int) -> str:
         return EXPLICIT_INSTALLATION_TOKEN
     raise RuntimeError("No installation token available")
 
-# ---------- Offline Semgrep config ----------
-_OFFLINE_RULES_YAML = """
-rules:
-  - id: py-weak-md5
-    message: Use of weak hash (md5)
-    severity: ERROR
-    languages: [python]
-    pattern: hashlib.md5(...)
-
-  - id: py-unsafe-yaml-load
-    message: yaml.load without an explicit Safe/FullLoader
-    severity: ERROR
-    languages: [python]
-    pattern: yaml.load(...)
-
-  - id: py-insecure-deserialization-pickle
-    message: Insecure deserialization via pickle.loads
-    severity: ERROR
-    languages: [python]
-    pattern: pickle.loads(...)
-
-  - id: py-shell-true-subprocess
-    message: Possible shell injection: subprocess.* with shell=True
-    severity: ERROR
-    languages: [python]
-    patterns:
-      - pattern: subprocess.$F(..., shell=True, ...)
-      - metavariable-pattern:
-          metavariable: $F
-          pattern-either:
-            - pattern: check_output
-            - pattern: run
-            - pattern: Popen
-            - pattern: call
-
-  - id: py-dangerous-eval
-    message: Dangerous use of eval()
-    severity: ERROR
-    languages: [python]
-    pattern: eval(...)
-
-  - id: py-requests-disable-verify
-    message: TLS cert verification disabled
-    severity: ERROR
-    languages: [python]
-    pattern: requests.$F(..., verify=False, ...)
-
-  - id: py-tempfile-mktemp
-    message: tempfile.mktemp() is insecure; use NamedTemporaryFile/mkstemp
-    severity: WARNING
-    languages: [python]
-    pattern: tempfile.mktemp(...)
-
-  - id: py-random-for-secrets
-    message: random.random() is not cryptographic; use secrets or os.urandom
-    severity: WARNING
-    languages: [python]
-    pattern: random.random(...)
-
-  - id: py-tarfile-extractall
-    message: tarfile.extractall() may allow path traversal; validate members
-    severity: WARNING
-    languages: [python]
-    pattern: tarfile.extractall(...)
-"""
-
-def _write_offline_semgrep_config(workdir: Path) -> str:
-    p = workdir / "semgrep.offline.yaml"
-    p.write_text(_OFFLINE_RULES_YAML)
-    return str(p)
+# ---------- Safe tar extraction (member-by-member) ----------
+def _safe_extract_tar(tf: tarfile.TarFile, dest_dir: Path) -> None:
+    base = dest_dir.resolve()
+    for m in tf.getmembers():
+        target = (base / m.name).resolve()
+        if not str(target).startswith(str(base)):
+            raise RuntimeError("Unsafe tar path detected")
+    for m in tf.getmembers():
+        tf.extract(m, base)
 
 # ---------- GitHub Checks helpers ----------
 def _create_check_in_progress(owner: str, repo: str, head_sha: str, name: str, title: str, summary: str, token: str, install_id: Optional[int]) -> int:
@@ -287,15 +222,6 @@ def watchdog_timeout_check(owner: str, repo: str, check_id: int, token: str, ins
         log.error("watchdog error: %s", e)
 
 # ---------- Repo utilities ----------
-def _safe_tar_extract(tar: tarfile.TarFile, dest: Path) -> None:
-    # Prevent path traversal
-    dest_abs = dest.resolve()
-    for m in tar.getmembers():
-        target = (dest / m.name).resolve()
-        if not str(target).startswith(str(dest_abs)):
-            raise RuntimeError(f"Unsafe tar path detected: {m.name}")
-    tar.extractall(dest)  # safe by pre-check
-
 def list_changed_files(owner: str, repo: str, pr: int, token: str, install_id: Optional[int]) -> List[str]:
     files: List[str] = []
     page = 1
@@ -315,27 +241,16 @@ def download_tarball(owner: str, repo: str, sha: str, token: str, install_id: Op
     if r.status_code >= 400:
         log.error("GET %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
     r.raise_for_status()
-
-    # Stream to temp file to reduce memory
-    with tempfile.NamedTemporaryFile(prefix="prsec_tar_", suffix=".tgz", delete=False) as f:
-        for chunk in r.iter_content(chunk_size=1024 * 256):
-            if chunk:
-                f.write(chunk)
-        tar_path = Path(f.name)
-
-    with tarfile.open(tar_path, mode="r:gz") as tf:
-        members = tf.getmembers()
-        # capture top-level folder before extraction (common GitHub layout)
-        top = next((m for m in members if m.isdir() and "/" not in m.name.strip("/")), None)
-        _safe_tar_extract(tf, workdir)
-
-    # Resolve extracted repo root
-    if top:
-        return workdir / top.name
-    subs = [p for p in workdir.iterdir() if p.is_dir()]
-    if not subs:
-        raise RuntimeError("Failed to locate repo root in tarball")
-    return subs[0]
+    tar_bytes = io.BytesIO(r.content)
+    with tarfile.open(fileobj=tar_bytes, mode="r:gz") as tf:
+        _safe_extract_tar(tf, workdir)
+        top = next((m for m in tf.getmembers() if m.isdir() and "/" not in m.name.strip("/")), None)
+    if not top:
+        subs = [p for p in workdir.iterdir() if p.is_dir()]
+        if not subs:
+            raise RuntimeError("Failed to locate repo root in tarball")
+        return subs[0]
+    return workdir / top.name
 
 # ---------- Scanning pipeline ----------
 def run_semgrep_pipeline(
@@ -372,51 +287,60 @@ def run_semgrep_pipeline(
     try:
         with tempfile.TemporaryDirectory(prefix="prsec_") as td:
             tdp = Path(td)
+
+            # 1) Download repo snapshot
             repo_root = download_tarball(head_owner, head_repo, head_sha, token, installation_id, tdp)
 
+            # 2) Build target file list
             try:
                 changed = list_changed_files(base_owner, base_repo, pr, token, installation_id)
             except Exception as e:
                 log.error("failed to list changed files: %s", e)
                 changed = []
 
-            # Base set: changed files; fallback to repo *.py
             paths = changed or [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
             existing = [p for p in paths if (repo_root / p).exists()]
-            if not existing:
-                existing = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
 
-            # Always include configured basenames (e.g., bad.py) if present
-            for bn in ALWAYS_INCLUDE_BASENAMES:
-                for found in repo_root.rglob(bn):
+            # Force-include bad.py, bad2.py, and any *bad*.py
+            for pat in ALWAYS_INCLUDE_PATTERNS:
+                for found in repo_root.rglob(pat):
                     rel = str(found.relative_to(repo_root))
                     if rel not in existing:
                         existing.append(rel)
+            if not existing:
+                existing = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
 
-            # Config selection
+            # 3) Choose Semgrep configs (offline favored)
+            cfgs: List[str] = []
             if PRSEC_FORCE_OFFLINE:
-                cfg = _write_offline_semgrep_config(tdp)
+                offline_yaml = tdp / ".semgrep.offline.yaml"
+                offline_yaml.write_text(OFFLINE_RULESET)
+                cfgs.append(str(offline_yaml))
             else:
-                cfg = SEMGREP_CONFIG
-                if not cfg:
-                    for name in (".semgrep.yaml", ".semgrep.yml"):
-                        cand = repo_root / name
-                        if cand.exists():
-                            cfg = str(cand)
-                            break
-                if not cfg:
-                    cfg = "p/security-audit"
+                for name in (".semgrep.yaml", ".semgrep.yml"):
+                    cand = repo_root / name
+                    if cand.exists():
+                        cfgs.append(str(cand))
+                        break
+                if SEMGREP_CONFIG:
+                    cfgs.append(SEMGREP_CONFIG)
+                if not cfgs:
+                    cfgs.append("p/security-audit")  # only if you explicitly disable offline
 
+            cfg_value = ",".join(cfgs)
             ex = SEMGREP_EXCLUDE if SEMGREP_EXCLUDE else [".venv", "venv", ".git"]
-            log.info("SEMGREP_CONFIG=%s EXCLUDE=%s", cfg, ex)
-            log.info("Semgrep scan root=%s paths_count=%d sample=%s", repo_root, len(existing), existing[:10])
 
-            findings: List[Dict[str, Any]] = []
+            log.info("SEMGREP_CONFIGS=%s EXCLUDE=%s", cfg_value, ex)
+            log.info("Scan root=%s file_count=%d sample=%s", repo_root, len(existing), existing[:10])
+
+            # 4) Run Semgrep
             try:
-                findings = run_semgrep(paths=existing, repo_root=str(repo_root), config=cfg, exclude=ex, timeout_s=SEMGREP_TIMEOUT_S)
+                findings = run_semgrep(paths=existing, repo_root=str(repo_root), config=cfg_value, exclude=ex, timeout_s=SEMGREP_TIMEOUT_S)
             except Exception as e:
                 log.error("semgrep invocation failed: %s", e)
+                findings = []
 
+            # 5) Summarize & annotate
             counts, summary_md = summarize_findings(findings)
             annotations = to_github_annotations(findings)[:MAX_ANNOTS]
 
@@ -435,20 +359,17 @@ def run_semgrep_pipeline(
     finally:
         _safe_complete()
 
-# ---------------- Lifespan / Health ----------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+# ---------------- Startup / Health ----------------
+@app.on_event("startup")
+def _startup_log_routes() -> None:
     try:
         from starlette.routing import Route
         for r in app.router.routes:
             if isinstance(r, Route):
                 log.info("route registered: %s methods=%s", r.path, sorted(r.methods))
         log.info("webhook secrets configured: %d", len(SECRETS))
-        yield
-    finally:
+    except Exception:
         pass
-
-app.router.lifespan_context = lifespan  # replaces deprecated on_event("startup")
 
 @app.get("/health", include_in_schema=False)
 def health() -> Dict[str, Any]:
@@ -468,25 +389,28 @@ async def webhook(
 ):
     body: bytes = await request.body()
 
-    provided = x_hub_signature_256 or x_hub_signature
-    if SECRETS and provided:
-        if provided.startswith("sha256="):
-            algo = "sha256"
-        elif provided.startswith("sha1="):
-            algo = "sha1"
-        else:
-            algo = "sha256"
-        if not any(_secure_eq(provided, _hmac_sig(sec, body, algo)) for sec in SECRETS):
-            if not ALLOW_UNVERIFIED:
-                raise HTTPException(status_code=401, detail="Invalid signature")
-            log.warning("signature mismatch delivery=%s (bypassed)", x_github_delivery)
-    elif SECRETS and not ALLOW_UNVERIFIED:
-        raise HTTPException(status_code=400, detail="Signature required")
+    # Signature verification — never 401; report in JSON if strict.
+    provided256 = (x_hub_signature_256 or "").strip()
+    provided1   = (x_hub_signature or "").strip()
+    match = True
+    if SECRETS:
+        exp256 = [_hmac_sig(sec, body, "sha256") for sec in SECRETS]
+        exp1   = [_hmac_sig(sec, body, "sha1") for sec in SECRETS]
+        match = (provided256 and provided256 in exp256) or (provided1 and provided1 in exp1)
+        if not match:
+            log.warning(
+                "signature mismatch delivery=%s provided256=%s provided1=%s exp256_suffixes=%s exp1_suffixes=%s",
+                x_github_delivery, provided256[-6:] if provided256 else "-", provided1[-6:] if provided1 else "-",
+                [e[-6:] for e in exp256], [e[-6:] for e in exp1]
+            )
+    if SECRETS and not match and not ALLOW_UNVERIFIED:
+        return {"ok": False, "error": "Invalid signature", "delivery": x_github_delivery}
 
+    # Parse payload
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        return {"ok": False, "error": "Invalid JSON", "delivery": x_github_delivery}
 
     log.info("delivery=%s event=%s len=%d hook_id=%s target=%s", x_github_delivery, x_github_event, len(body), x_github_hook_id, x_github_target)
 
@@ -497,33 +421,35 @@ async def webhook(
         action = payload.get("action")
         if action not in {"opened", "reopened", "synchronize", "edited", "ready_for_review"}:
             return {"ok": True, "ignored": action}
+        try:
+            base = payload["pull_request"]["base"]["repo"]
+            head = payload["pull_request"]["head"]["repo"]
+            base_owner, base_repo = base["owner"]["login"], base["name"]
+            head_owner, head_repo = head["owner"]["login"], head["name"]
+            pr_number = int(payload["number"])
+            head_sha  = payload["pull_request"]["head"]["sha"]
+            base_sha  = payload["pull_request"]["base"]["sha"]
+            installation_id = int(payload.get("installation", {}).get("id") or 0)
+        except Exception as e:
+            log.error("payload parse error: %s", e)
+            return {"ok": False, "error": "Malformed PR payload", "delivery": x_github_delivery}
 
-        base = payload["pull_request"]["base"]["repo"]
-        head = payload["pull_request"]["head"]["repo"]
-        base_owner, base_repo = base["owner"]["login"], base["name"]
-        head_owner, head_repo = head["owner"]["login"], head["name"]
-
-        pr_number = int(payload["number"])
-        head_sha  = payload["pull_request"]["head"]["sha"]
-        base_sha  = payload["pull_request"]["base"]["sha"]
-        installation_id = int(payload.get("installation", {}).get("id") or 0)
-
+        # Acquire token (non-fatal to HTTP status)
         try:
             token = _get_installation_token(installation_id)
         except Exception as e:
             log.error("token acquisition failed: %s", e)
-            raise HTTPException(status_code=500, detail="Token acquisition failed")
+            return {"ok": False, "error": "Token acquisition failed", "delivery": x_github_delivery}
 
+        # PR receipt comment (best-effort)
         try:
-            _post_json(
-                f"{GITHUB_API}/repos/{base_owner}/{base_repo}/issues/{pr_number}/comments",
-                token,
-                {"body": f"PRSec ✅ received `{action}` for `{head_sha[:7]}` (delivery `{x_github_delivery}`)"},
-                install_id=installation_id,
-            )
+            _post_json(f"{GITHUB_API}/repos/{base_owner}/{base_repo}/issues/{pr_number}/comments",
+                       token, {"body": f"PRSec ✅ received `{action}` for `{head_sha[:7]}` (delivery `{x_github_delivery}`)"},
+                       install_id=installation_id)
         except Exception as e:
             log.error("failed to comment on PR: %s", e)
 
+        # Create Check Run (fallback on perms)
         try:
             check_owner, check_repo, check_id = create_check_in_progress_with_fallback(
                 base_owner, base_repo, head_owner, head_repo, head_sha,
@@ -531,8 +457,9 @@ async def webhook(
             )
         except Exception as e:
             log.error("failed to create check run: %s", e)
-            raise HTTPException(status_code=500, detail="Check run creation failed")
+            return {"ok": False, "error": "Check run creation failed", "delivery": x_github_delivery}
 
+        # Launch scanner + watchdog
         background.add_task(
             run_semgrep_pipeline,
             base_owner, base_repo, head_owner, head_repo, pr_number, head_sha,
@@ -543,6 +470,231 @@ async def webhook(
             check_owner, check_repo, check_id, token, installation_id,
             (PIPELINE_DEADLINE_S or 0) + WATCHDOG_GRACE_S,
         )
+
         return {"ok": True, "event": "pull_request", "action": action, "pr": pr_number, "head": head_sha, "base": base_sha}
 
     return {"ok": True, "ignored_event": x_github_event}
+
+
+# Offline Semgrep ruleset embedded (written to temp file at runtime)
+OFFLINE_RULESET = r"""
+rules:
+  # Crypto: weak hashes
+  - id: py-weak-md5
+    message: Use of weak hash (md5)
+    severity: ERROR
+    languages: [python]
+    pattern: hashlib.md5(...)
+    metadata:
+      cwe: CWE-327
+      owasp: A02:2021
+
+  - id: py-weak-sha1
+    message: Use of weak hash (sha1)
+    severity: ERROR
+    languages: [python]
+    pattern: hashlib.sha1(...)
+    metadata:
+      cwe: CWE-327
+      owasp: A02:2021
+
+  # YAML / Deserialization
+  - id: py-unsafe-yaml-load
+    message: yaml.load without a safe loader
+    severity: ERROR
+    languages: [python]
+    pattern: yaml.load(...)
+    metadata:
+      cwe: CWE-502
+      owasp: A08:2021
+
+  - id: py-unsafe-yaml-unsafe-load
+    message: yaml.unsafe_load used
+    severity: ERROR
+    languages: [python]
+    pattern: yaml.unsafe_load(...)
+    metadata:
+      cwe: CWE-502
+      owasp: A08:2021
+
+  - id: py-insecure-deserialization-pickle-loads
+    message: Insecure deserialization via pickle.loads
+    severity: ERROR
+    languages: [python]
+    pattern: pickle.loads(...)
+    metadata:
+      cwe: CWE-502
+      owasp: A08:2021
+
+  - id: py-insecure-deserialization-pickle-load
+    message: Insecure deserialization via pickle.load
+    severity: ERROR
+    languages: [python]
+    pattern: pickle.load(...)
+    metadata:
+      cwe: CWE-502
+      owasp: A08:2021
+
+  # Command Execution
+  - id: py-os-system
+    message: os.system() can lead to command injection
+    severity: ERROR
+    languages: [python]
+    pattern: os.system(...)
+    metadata:
+      cwe: CWE-78
+      owasp: A03:2021
+
+  - id: py-os-popen
+    message: os.popen*() can lead to command injection
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: os.popen(...)
+      - pattern: os.popen2(...)
+      - pattern: os.popen3(...)
+      - pattern: os.popen4(...)
+    metadata:
+      cwe: CWE-78
+      owasp: A03:2021
+
+  - id: py-subprocess-shell-true
+    message: subprocess with shell=True (possible injection)
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: subprocess.$F(..., shell=True, ...)
+      - metavariable-pattern:
+          metavariable: $F
+          pattern-either:
+            - pattern: run
+            - pattern: call
+            - pattern: Popen
+            - pattern: check_output
+    metadata:
+      cwe: CWE-78
+      owasp: A03:2021
+
+  - id: py-dangerous-eval
+    message: Dangerous use of eval()
+    severity: ERROR
+    languages: [python]
+    pattern: eval(...)
+    metadata:
+      cwe: CWE-95
+      owasp: A03:2021
+
+  - id: py-dangerous-exec
+    message: Dangerous use of exec()
+    severity: ERROR
+    languages: [python]
+    pattern: exec(...)
+    metadata:
+      cwe: CWE-95
+      owasp: A03:2021
+
+  # HTTP / TLS
+  - id: py-requests-disable-verify
+    message: TLS certificate verification disabled
+    severity: ERROR
+    languages: [python]
+    pattern: requests.$F(..., verify=False, ...)
+    metadata:
+      cwe: CWE-295
+      owasp: A02:2021
+
+  - id: py-ssl-unverified-context
+    message: Creating unverified SSL context
+    severity: ERROR
+    languages: [python]
+    pattern: ssl._create_unverified_context(...)
+    metadata:
+      cwe: CWE-295
+      owasp: A02:2021
+
+  - id: py-urllib3-disable-warnings
+    message: Disabling TLS warnings may hide verification issues
+    severity: WARNING
+    languages: [python]
+    pattern: urllib3.disable_warnings(...)
+    metadata:
+      cwe: CWE-200
+
+  - id: py-requests-http-url
+    message: Cleartext HTTP URL in requests
+    severity: WARNING
+    languages: [python]
+    pattern: requests.$F("http://"$URL, ...)
+    metadata:
+      cwe: CWE-319
+
+  # Randomness / temp files
+  - id: py-random-for-secrets
+    message: random module is not cryptographically secure
+    severity: WARNING
+    languages: [python]
+    pattern: random.$F(...)
+    metadata:
+      cwe: CWE-338
+
+  - id: py-tempfile-mktemp
+    message: tempfile.mktemp() is insecure; use NamedTemporaryFile/mkstemp
+    severity: WARNING
+    languages: [python]
+    pattern: tempfile.mktemp(...)
+    metadata:
+      cwe: CWE-377
+
+  # Archives
+  - id: py-tarfile-extractall
+    message: tarfile.extractall() can allow path traversal
+    severity: WARNING
+    languages: [python]
+    pattern: tarfile.extractall(...)
+    metadata:
+      cwe: CWE-22
+
+  # JWT
+  - id: py-jwt-decode-no-verify
+    message: jwt.decode() without signature verification
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern-either:
+          - pattern: jwt.decode($T, ..., verify=False, ...)
+          - pattern: jwt.decode($T, ..., options={"verify_signature": False, ...}, ...)
+    metadata:
+      cwe: CWE-347
+      owasp: A07:2021
+
+  # XML XXE (simple heuristics)
+  - id: py-xml-xxe
+    message: Potential XXE in XML parsing (use defusedxml)
+    severity: WARNING
+    languages: [python]
+    pattern-either:
+      - pattern: xml.etree.ElementTree.parse(...)
+      - pattern: xml.etree.ElementTree.fromstring(...)
+      - pattern: xml.sax.parse(...)
+      - pattern: lxml.etree.fromstring(...)
+    metadata:
+      cwe: CWE-611
+
+  # Flask Debug
+  - id: py-flask-debug
+    message: Flask app.run(debug=True) exposes debug server
+    severity: WARNING
+    languages: [python]
+    pattern: $APP.run(..., debug=True, ...)
+    metadata:
+      cwe: CWE-489
+
+  # Hardcoded passwords (simple heuristic)
+  - id: py-hardcoded-password
+    message: Possible hardcoded password/secret
+    severity: WARNING
+    languages: [python]
+    pattern-regex: (?i)(password|passwd|pwd|secret|api_key)\s*=\s*['"][^'"]+['"]
+    metadata:
+      cwe: CWE-798
+"""

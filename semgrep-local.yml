@@ -1,0 +1,6 @@
+rules:
+  - id: python.eval
+    languages: [python]
+    message: "Avoid eval()"
+    severity: HIGH
+    patterns: [ { pattern: eval($X) } ]

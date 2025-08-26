@@ -689,8 +689,8 @@ rules:
     metadata:
       cwe: CWE-489
 
-  # Hardcoded passwords (simple heuristic)
-  - id: py-hardcoded-password
+  # Hardcoded passwords (simple heuristic)#
+  - id: py-hardcoded-passwordg
     message: Possible hardcoded password/secret
     severity: WARNING
     languages: [python]

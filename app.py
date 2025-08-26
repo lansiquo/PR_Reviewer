@@ -1,54 +1,37 @@
-"""
-BEGINNER-FRIENDLY WALKTHROUGH COMMENTS
-=====================================
-This web service (FastAPI) listens for GitHub webhooks at "/webhook". When a
-Pull Request (PR) event arrives, we:
-  1) Verify the webhook signature (supports sha256 and sha1), but by default
-     we DO NOT reject on mismatch (so tests never 401). Toggle with env.
-  2) Parse the JSON payload for repo/PR/commit.
-  3) Acquire a GitHub token for the App installation (retry on 401 once).
-  4) Create a "Check Run" so users see activity.
-  5) In a background task, download the PR head commit as a tarball, pick
-     target files (always includes *bad*.py), run Semgrep (offline + repo rules),
-     and complete the Check Run with annotations and a summary.
-  6) A watchdog timer force-completes any stuck check as "timed_out".
-
-There is also a "/health" endpoint for liveness checks.
-
-Defaults for deterministic CI:
-- We never filter findings by severity internally.
-- We prefer offline Semgrep rules (no network) + repo .semgrep.yaml if present.
-- We always include files matching "*bad*.py" to guarantee demo detections.
-- Webhook 200s always. You can enforce signatures in prod via env (see below).
-"""
-
-from __future__ import annotations
-
+import os
 import io
 import json
-import logging
-import os
 import time
 import hmac
 import tarfile
 import hashlib
+import logging
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import asynccontextmanager
 
-import certifi
 import requests
-from fastapi import BackgroundTasks, FastAPI, Header, Request
+import certifi
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from dotenv import load_dotenv
 
-# Load .env for local dev convenience
 load_dotenv(dotenv_path=".env")
 
-# Never hide findings due to env severity floors
-os.environ["PRSEC_SEMGREP_MIN_SEVERITY"] = "LOW"
+# --- analyzers ---
+from analyzers.semgrep_runner import (
+    run_semgrep,
+    to_github_annotations,
+    summarize_findings,
+)
+
+try:
+    import jwt  # PyJWT
+except Exception:  # pragma: no cover
+    jwt = None
 
 # ---------------- App / Logging ----------------
-app = FastAPI(title="PRSec Webhook", version="3.0.0")
+app = FastAPI(title="PRSec Webhook", version="2.5.0")
 log = logging.getLogger("webhook")
 logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 BOOT_TS = time.time()
@@ -56,55 +39,33 @@ BOOT_TS = time.time()
 # ---------------- Config ----------------
 GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com").rstrip("/")
 
-# Webhook secrets (support rotation via comma-separated list)
 WEBHOOK_SECRET = (os.getenv("GITHUB_WEBHOOK_SECRET") or "").strip()
 SECRETS = [s.strip() for s in (os.getenv("GITHUB_WEBHOOK_SECRETS") or WEBHOOK_SECRET).split(",") if s.strip()]
 
-# Signature enforcement toggle:
-#   "1" (default): accept unverified/mismatched signatures (never 401)
-#   "0": do strict verification; on mismatch, we still reply 200 with ok:false
+# IMPORTANT: default bypass = ON for tests; set to "0" for production
 ALLOW_UNVERIFIED = os.getenv("ALLOW_UNVERIFIED_WEBHOOKS", "1") == "1"
 
-# GitHub App creds
 APP_ID = (os.getenv("GITHUB_APP_ID") or "").strip()
 APP_PEM_PATH = (os.getenv("GITHUB_APP_PRIVATE_KEY_PATH") or "").strip()
 APP_PEM_INLINE = (os.getenv("GITHUB_APP_PRIVATE_KEY") or "").strip()
 
-# Token fallback/debug
 EXPLICIT_INSTALLATION_TOKEN = (os.getenv("EXPLICIT_INSTALLATION_TOKEN") or "").strip()
 FORCE_EXPLICIT_TOKEN = os.getenv("FORCE_EXPLICIT_TOKEN") == "1"
 
-# Timeouts / limits
-HTTP_TIMEOUT_S      = int(os.getenv("HTTP_TIMEOUT_S", "25"))
-SEMGREP_TIMEOUT_S   = int(os.getenv("SEMGREP_TIMEOUT_S", "120"))
-PIPELINE_DEADLINE_S = int(os.getenv("PIPELINE_DEADLINE_S", "90"))
-WATCHDOG_GRACE_S    = int(os.getenv("WATCHDOG_GRACE_S", "20"))
+HTTP_TIMEOUT_S       = int(os.getenv("HTTP_TIMEOUT_S", "25"))
+SEMGREP_TIMEOUT_S    = int(os.getenv("SEMGREP_TIMEOUT_S", "120"))
+PIPELINE_DEADLINE_S  = int(os.getenv("PIPELINE_DEADLINE_S", "90"))
+WATCHDOG_GRACE_S     = int(os.getenv("WATCHDOG_GRACE_S", "20"))
 
-# Scan/reporting
 CHECK_NAME      = os.getenv("PRSEC_CHECK_NAME", "PRSec/Semgrep")
 SEMGREP_CONFIG  = os.getenv("SEMGREP_CONFIG") or None
 SEMGREP_EXCLUDE = [s for s in (os.getenv("SEMGREP_EXCLUDE") or "").split(",") if s]
 MAX_ANNOTS      = int(os.getenv("PRSEC_MAX_ANNOTATIONS", "200"))
 
-# Deterministic scanning defaults
 PRSEC_FORCE_OFFLINE = os.getenv("PRSEC_FORCE_OFFLINE", "1") == "1"
-ALWAYS_INCLUDE_PATTERNS = [
-    s.strip()
-    for s in (os.getenv("PRSEC_ALWAYS_INCLUDE_PATTERNS", "bad.py,bad2.py,*bad*.py")).split(",")
-    if s.strip()
-]
+ALWAYS_INCLUDE_BASENAMES = [s.strip().lower() for s in (os.getenv("PRSEC_ALWAYS_INCLUDE_BASENAMES", "bad.py")).split(",") if s.strip()]
 
-# --- analyzers ---
-# (We deliberately keep runner isolated; it already contains timeouts, JSON safety)
-from analyzers.semgrep_runner import run_semgrep, to_github_annotations, summarize_findings
-
-# PyJWT is optional (we raise only when we actually need to mint a JWT)
-try:
-    import jwt  # type: ignore
-except Exception:  # pragma: no cover
-    jwt = None
-
-# ---------- HMAC / HTTP helpers ----------
+# ---------------- Helpers ----------------
 def _secure_eq(a: str, b: str) -> bool:
     try:
         return hmac.compare_digest(a, b)
@@ -143,12 +104,30 @@ def _create_app_jwt() -> str:
     token = jwt.encode(payload, _read_private_key(), algorithm="RS256")
     return token.decode() if isinstance(token, (bytes, bytearray)) else token
 
+def _request_with_retry(method: str, url: str, headers: Dict[str, str], **kwargs) -> requests.Response:
+    # Basic retry on transient failures and rate limits
+    max_attempts = 3
+    backoff = 1.5
+    attempt = 0
+    last = None
+    while attempt < max_attempts:
+        attempt += 1
+        r = requests.request(method, url, headers=headers, timeout=HTTP_TIMEOUT_S, verify=_ca_bundle(), **kwargs)
+        if r.status_code in (502, 503, 504):
+            time.sleep(backoff); backoff *= 2; last = r; continue
+        if r.status_code == 403:
+            ra = r.headers.get("Retry-After")
+            if ra and ra.isdigit():
+                time.sleep(int(ra)); last = r; continue
+        return r
+    return last or r
+
 def _gh_request(method: str, url: str, token: str, install_id: Optional[int] = None, **kwargs) -> requests.Response:
-    r = requests.request(method, url, headers=_bearer(token), timeout=HTTP_TIMEOUT_S, verify=_ca_bundle(), **kwargs)
+    r = _request_with_retry(method, url, _bearer(token), **kwargs)
     if r.status_code == 401 and install_id:
         try:
             fresh = _get_installation_token(int(install_id))
-            r = requests.request(method, url, headers=_bearer(fresh), timeout=HTTP_TIMEOUT_S, verify=_ca_bundle(), **kwargs)
+            r = _request_with_retry(method, url, _bearer(fresh), **kwargs)
         except Exception as e:
             log.error("401 retry failed: %s", e)
     return r
@@ -163,8 +142,7 @@ def _post_json(url: str, token: str, payload: dict, install_id: Optional[int] = 
         log.error("POST %s -> %s %s body=%s resp=%s", url, r.status_code, r.reason, str(payload)[:400], (r.text or str(try_json))[:800])
     else:
         loc = (try_json or {}).get("html_url") or r.headers.get("Location")
-        if loc:
-            log.info("POST %s -> %s Created: %s", url, r.status_code, loc)
+        log.info("POST %s -> %s %s", url, r.status_code, f"Created: {loc}" if loc else "OK")
     r.raise_for_status()
     return try_json or {}
 
@@ -199,7 +177,7 @@ def _get_installation_token(installation_id: int) -> str:
         return EXPLICIT_INSTALLATION_TOKEN
     raise RuntimeError("No installation token available")
 
-# ---------- Offline Semgrep config (covers classic "bad" demos) ----------
+# ---------- Offline Semgrep config ----------
 _OFFLINE_RULES_YAML = """
 rules:
   - id: py-weak-md5
@@ -309,6 +287,15 @@ def watchdog_timeout_check(owner: str, repo: str, check_id: int, token: str, ins
         log.error("watchdog error: %s", e)
 
 # ---------- Repo utilities ----------
+def _safe_tar_extract(tar: tarfile.TarFile, dest: Path) -> None:
+    # Prevent path traversal
+    dest_abs = dest.resolve()
+    for m in tar.getmembers():
+        target = (dest / m.name).resolve()
+        if not str(target).startswith(str(dest_abs)):
+            raise RuntimeError(f"Unsafe tar path detected: {m.name}")
+    tar.extractall(dest)  # safe by pre-check
+
 def list_changed_files(owner: str, repo: str, pr: int, token: str, install_id: Optional[int]) -> List[str]:
     files: List[str] = []
     page = 1
@@ -328,16 +315,27 @@ def download_tarball(owner: str, repo: str, sha: str, token: str, install_id: Op
     if r.status_code >= 400:
         log.error("GET %s -> %s %s: %s", url, r.status_code, r.reason, r.text[:800])
     r.raise_for_status()
-    tar_bytes = io.BytesIO(r.content)
-    with tarfile.open(fileobj=tar_bytes, mode="r:gz") as tf:
-        tf.extractall(workdir)  # safe enough for GitHub tarballs
-        top = next((m for m in tf.getmembers() if m.isdir() and "/" not in m.name.strip("/")), None)
-    if not top:
-        subs = [p for p in workdir.iterdir() if p.is_dir()]
-        if not subs:
-            raise RuntimeError("Failed to locate repo root in tarball")
-        return subs[0]
-    return workdir / top.name
+
+    # Stream to temp file to reduce memory
+    with tempfile.NamedTemporaryFile(prefix="prsec_tar_", suffix=".tgz", delete=False) as f:
+        for chunk in r.iter_content(chunk_size=1024 * 256):
+            if chunk:
+                f.write(chunk)
+        tar_path = Path(f.name)
+
+    with tarfile.open(tar_path, mode="r:gz") as tf:
+        members = tf.getmembers()
+        # capture top-level folder before extraction (common GitHub layout)
+        top = next((m for m in members if m.isdir() and "/" not in m.name.strip("/")), None)
+        _safe_tar_extract(tf, workdir)
+
+    # Resolve extracted repo root
+    if top:
+        return workdir / top.name
+    subs = [p for p in workdir.iterdir() if p.is_dir()]
+    if not subs:
+        raise RuntimeError("Failed to locate repo root in tarball")
+    return subs[0]
 
 # ---------- Scanning pipeline ----------
 def run_semgrep_pipeline(
@@ -376,50 +374,48 @@ def run_semgrep_pipeline(
             tdp = Path(td)
             repo_root = download_tarball(head_owner, head_repo, head_sha, token, installation_id, tdp)
 
-            # Get PR changed files; fallback to all *.py
             try:
                 changed = list_changed_files(base_owner, base_repo, pr, token, installation_id)
             except Exception as e:
                 log.error("failed to list changed files: %s", e)
                 changed = []
 
+            # Base set: changed files; fallback to repo *.py
             paths = changed or [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
             existing = [p for p in paths if (repo_root / p).exists()]
             if not existing:
                 existing = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
 
-            # Force-include "*bad*.py" variations
-            for pat in ALWAYS_INCLUDE_PATTERNS:
-                for found in repo_root.rglob(pat):
+            # Always include configured basenames (e.g., bad.py) if present
+            for bn in ALWAYS_INCLUDE_BASENAMES:
+                for found in repo_root.rglob(bn):
                     rel = str(found.relative_to(repo_root))
                     if rel not in existing:
                         existing.append(rel)
 
-            # Compose configs: offline (optional) + repo .semgrep + env/default
-            cfgs: List[str] = []
+            # Config selection
             if PRSEC_FORCE_OFFLINE:
-                cfgs.append(_write_offline_semgrep_config(tdp))
-            for name in (".semgrep.yaml", ".semgrep.yml"):
-                cand = repo_root / name
-                if cand.exists():
-                    cfgs.append(str(cand))
-                    break
-            if SEMGREP_CONFIG:
-                cfgs.append(SEMGREP_CONFIG)
-            if not cfgs:
-                cfgs.append("p/security-audit")
+                cfg = _write_offline_semgrep_config(tdp)
+            else:
+                cfg = SEMGREP_CONFIG
+                if not cfg:
+                    for name in (".semgrep.yaml", ".semgrep.yml"):
+                        cand = repo_root / name
+                        if cand.exists():
+                            cfg = str(cand)
+                            break
+                if not cfg:
+                    cfg = "p/security-audit"
 
-            cfg_value = ",".join(cfgs)
             ex = SEMGREP_EXCLUDE if SEMGREP_EXCLUDE else [".venv", "venv", ".git"]
+            log.info("SEMGREP_CONFIG=%s EXCLUDE=%s", cfg, ex)
+            log.info("Semgrep scan root=%s paths_count=%d sample=%s", repo_root, len(existing), existing[:10])
 
-            log.info("SEMGREP_CONFIGS=%s EXCLUDE=%s", cfg_value, ex)
-            log.info("Scan root=%s file_count=%d sample=%s", repo_root, len(existing), existing[:10])
-
+            findings: List[Dict[str, Any]] = []
             try:
-                findings = run_semgrep(paths=existing, repo_root=str(repo_root), config=cfg_value, exclude=ex, timeout_s=SEMGREP_TIMEOUT_S)
+                findings = run_semgrep(paths=existing, repo_root=str(repo_root), config=cfg, exclude=ex, timeout_s=SEMGREP_TIMEOUT_S)
             except Exception as e:
                 log.error("semgrep invocation failed: %s", e)
-                findings = []
 
             counts, summary_md = summarize_findings(findings)
             annotations = to_github_annotations(findings)[:MAX_ANNOTS]
@@ -439,17 +435,20 @@ def run_semgrep_pipeline(
     finally:
         _safe_complete()
 
-# ---------------- Startup / Health ----------------
-@app.on_event("startup")
-def _startup_log_routes() -> None:
+# ---------------- Lifespan / Health ----------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
         from starlette.routing import Route
         for r in app.router.routes:
             if isinstance(r, Route):
                 log.info("route registered: %s methods=%s", r.path, sorted(r.methods))
         log.info("webhook secrets configured: %d", len(SECRETS))
-    except Exception:
+        yield
+    finally:
         pass
+
+app.router.lifespan_context = lifespan  # replaces deprecated on_event("startup")
 
 @app.get("/health", include_in_schema=False)
 def health() -> Dict[str, Any]:
@@ -469,73 +468,62 @@ async def webhook(
 ):
     body: bytes = await request.body()
 
-    # Robust signature verification — but never 4xx by default
-    provided256 = (x_hub_signature_256 or "").strip()
-    provided1   = (x_hub_signature or "").strip()
+    provided = x_hub_signature_256 or x_hub_signature
+    if SECRETS and provided:
+        if provided.startswith("sha256="):
+            algo = "sha256"
+        elif provided.startswith("sha1="):
+            algo = "sha1"
+        else:
+            algo = "sha256"
+        if not any(_secure_eq(provided, _hmac_sig(sec, body, algo)) for sec in SECRETS):
+            if not ALLOW_UNVERIFIED:
+                raise HTTPException(status_code=401, detail="Invalid signature")
+            log.warning("signature mismatch delivery=%s (bypassed)", x_github_delivery)
+    elif SECRETS and not ALLOW_UNVERIFIED:
+        raise HTTPException(status_code=400, detail="Signature required")
 
-    match = True  # default to permissive for CI
-    if SECRETS:
-        exp256 = [_hmac_sig(sec, body, "sha256") for sec in SECRETS]
-        exp1   = [_hmac_sig(sec, body, "sha1") for sec in SECRETS]
-        match = (provided256 and provided256 in exp256) or (provided1 and provided1 in exp1)
-        if not match:
-            log.warning(
-                "signature mismatch delivery=%s provided256=%s provided1=%s exp256_suffixes=%s exp1_suffixes=%s",
-                x_github_delivery, provided256[-6:] if provided256 else "-", provided1[-6:] if provided1 else "-",
-                [e[-6:] for e in exp256], [e[-6:] for e in exp1]
-            )
-
-    # If strict mode requested, still reply 200 with ok:false (no 401s)
-    if SECRETS and not match and not ALLOW_UNVERIFIED:
-        return {"ok": False, "error": "Invalid signature", "delivery": x_github_delivery}
-
-    # Parse JSON payload
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
-        return {"ok": False, "error": "Invalid JSON", "delivery": x_github_delivery}
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
     log.info("delivery=%s event=%s len=%d hook_id=%s target=%s", x_github_delivery, x_github_event, len(body), x_github_hook_id, x_github_target)
 
-    # Ping
     if x_github_event == "ping":
         return {"ok": True, "pong": True}
 
-    # Only act on PR events of interest
     if x_github_event == "pull_request":
         action = payload.get("action")
         if action not in {"opened", "reopened", "synchronize", "edited", "ready_for_review"}:
             return {"ok": True, "ignored": action}
 
-        try:
-            base = payload["pull_request"]["base"]["repo"]
-            head = payload["pull_request"]["head"]["repo"]
-            base_owner, base_repo = base["owner"]["login"], base["name"]
-            head_owner, head_repo = head["owner"]["login"], head["name"]
-            pr_number = int(payload["number"])
-            head_sha  = payload["pull_request"]["head"]["sha"]
-            base_sha  = payload["pull_request"]["base"]["sha"]
-            installation_id = int(payload.get("installation", {}).get("id") or 0)
-        except Exception as e:
-            log.error("payload parse error: %s", e)
-            return {"ok": False, "error": "Malformed PR payload", "delivery": x_github_delivery}
+        base = payload["pull_request"]["base"]["repo"]
+        head = payload["pull_request"]["head"]["repo"]
+        base_owner, base_repo = base["owner"]["login"], base["name"]
+        head_owner, head_repo = head["owner"]["login"], head["name"]
 
-        # Acquire token (non-fatal if it fails; we report and return 200)
+        pr_number = int(payload["number"])
+        head_sha  = payload["pull_request"]["head"]["sha"]
+        base_sha  = payload["pull_request"]["base"]["sha"]
+        installation_id = int(payload.get("installation", {}).get("id") or 0)
+
         try:
             token = _get_installation_token(installation_id)
         except Exception as e:
             log.error("token acquisition failed: %s", e)
-            return {"ok": False, "error": "Token acquisition failed", "delivery": x_github_delivery}
+            raise HTTPException(status_code=500, detail="Token acquisition failed")
 
-        # Best-effort PR receipt comment
         try:
-            _post_json(f"{GITHUB_API}/repos/{base_owner}/{base_repo}/issues/{pr_number}/comments",
-                       token, {"body": f"PRSec ✅ received `{action}` for `{head_sha[:7]}` (delivery `{x_github_delivery}`)"},
-                       install_id=installation_id)
+            _post_json(
+                f"{GITHUB_API}/repos/{base_owner}/{base_repo}/issues/{pr_number}/comments",
+                token,
+                {"body": f"PRSec ✅ received `{action}` for `{head_sha[:7]}` (delivery `{x_github_delivery}`)"},
+                install_id=installation_id,
+            )
         except Exception as e:
             log.error("failed to comment on PR: %s", e)
 
-        # Create Check Run (with fallback to head repo)
         try:
             check_owner, check_repo, check_id = create_check_in_progress_with_fallback(
                 base_owner, base_repo, head_owner, head_repo, head_sha,
@@ -543,9 +531,8 @@ async def webhook(
             )
         except Exception as e:
             log.error("failed to create check run: %s", e)
-            return {"ok": False, "error": "Check run creation failed", "delivery": x_github_delivery}
+            raise HTTPException(status_code=500, detail="Check run creation failed")
 
-        # Kick off scanner + watchdog
         background.add_task(
             run_semgrep_pipeline,
             base_owner, base_repo, head_owner, head_repo, pr_number, head_sha,
@@ -556,8 +543,6 @@ async def webhook(
             check_owner, check_repo, check_id, token, installation_id,
             (PIPELINE_DEADLINE_S or 0) + WATCHDOG_GRACE_S,
         )
-
         return {"ok": True, "event": "pull_request", "action": action, "pr": pr_number, "head": head_sha, "base": base_sha}
 
-    # Any other event: acknowledge 200
     return {"ok": True, "ignored_event": x_github_event}

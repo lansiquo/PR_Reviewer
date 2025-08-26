@@ -13,6 +13,25 @@ import tempfile
 import random
 import os
 import tarfile
+import subprocess
+
+def f(user):
+    eval("1+1")                          # unsafe eval
+    subprocess.run("ls " + user, shell=True)  # shell=True
+
+
+
+def demo(user_input: str, user_cmd: str, data: str, blob: bytes, tar_path: str):
+    eval(user_input)                                   # ❌ unsafe eval
+    subprocess.run("ls " + user_cmd, shell=True)       # ❌ shell=True injection
+    hashlib.md5(b"password").hexdigest()               # ❌ weak hash (MD5)
+    yaml.load(data)                                    # ❌ unsafe YAML load (use safe_load)
+    pickle.loads(blob)                                 # ❌ unsafe deserialization
+    requests.get("https://example.com", verify=False)  # ❌ TLS verify disabled
+    with tarfile.open(tar_path, "r") as tf:
+        tf.extractall("/tmp/out")                      # ❌ unsafe extractall (path traversal)
+    tempfile.mktemp()                                  # ❌ insecure temp file creation
+
 
 
 def insecure_md5():

@@ -1,7 +1,3 @@
-configs:
-  - p/security-audit
-  - p/python
-  - p/bandit
 rules:
   - id: py-weak-md5
     message: Use of weak hash (md5)

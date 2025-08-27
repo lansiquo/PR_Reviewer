@@ -5,7 +5,7 @@ PyJWT
 cryptography
 pydantic>=2
 python-dotenv
-semgrep
+semgrep>1.2.0
 pytest
 httpx
 certifi>=2024.2.2

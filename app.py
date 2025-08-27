@@ -96,6 +96,7 @@ MAX_ANNOTS      = int(os.getenv("PRSEC_MAX_ANNOTATIONS", "200"))
 # **New knobs**
 PRSEC_FORCE_OFFLINE = os.getenv("PRSEC_FORCE_OFFLINE", "1") == "1"   # if true, use offline-only rules
 ALWAYS_INCLUDE_BASENAMES = [s.strip().lower() for s in (os.getenv("PRSEC_ALWAYS_INCLUDE_BASENAMES", "bad.py")).split(",") if s.strip()]
+ALWAYS_INCLUDE_GLOBS = [s.strip() for s in (os.getenv("PRSEC_ALWAYS_INCLUDE_PATTERNS") or "bad.py,bad2.py,*bad*.py").split(",") if s.strip()]
 
 # ---------------- Helpers ----------------
 
@@ -461,14 +462,15 @@ def run_semgrep_pipeline(
             if not existing:
                 existing = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*.py")]
 
-            # 4) Always include any bad.py (or configured basenames)
-            for bn in ALWAYS_INCLUDE_BASENAMES:
-                for found in repo_root.rglob(bn):
+                        # 4) Always include any files matching the configured globs (guarantees bad.py is scanned)
+            for pat in ALWAYS_INCLUDE_GLOBS:
+                for found in repo_root.rglob(pat):
                     rel = str(found.relative_to(repo_root))
                     if rel not in existing:
                         existing.append(rel)
-            log.info("final scan set size=%d includes_bad=%s", len(existing), any(Path(p).name.lower() in ALWAYS_INCLUDE_BASENAMES for p in existing))
-
+            log.info("final scan set size=%d includes_bad=%s",
+                    len(existing),
+                    any(Path(p).name.lower().startswith("bad") for p in existing))
             # 5) Choose config
             cfg = None
             if PRSEC_FORCE_OFFLINE:

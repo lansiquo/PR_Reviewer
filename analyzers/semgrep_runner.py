@@ -25,6 +25,10 @@ def run_semgrep(
     exclude: Optional[List[str]] = None,
     timeout_s: int = 60,
 ) -> List[Dict[str, Any]]:
+    """
+    Run Semgrep on (repo_root + includes). We always add include-globs so bad.py is picked up
+    even when PR file lists omit it.
+    """
     semgrep_bin = _ensure_semgrep_available()
     cfgs = _resolve_configs(config, repo_root)
 
@@ -37,6 +41,11 @@ def run_semgrep(
     findings: List[Dict[str, Any]] = []
     floor = _severity_floor(os.getenv("PRSEC_SEMGREP_MIN_SEVERITY"))
     target = "."
+
+    # Quiet Semgrep’s own warnings so they don’t flood STDERR and hide real errors
+    env = dict(os.environ)
+    env.setdefault("SEMGREP_LOG_LEVEL", "error")
+    env.setdefault("PYTHONWARNINGS", "ignore")
 
     for inc_chunk in _chunk(includes, 200):
         cmd: List[str] = [
@@ -53,14 +62,21 @@ def run_semgrep(
             cmd += ["--config", c]
         for e in excludes:
             cmd += ["--exclude", e]
+
+        # Semgrep requirement: includes come AFTER targets
         cmd.append(target)
         for inc in inc_chunk:
             cmd += ["--include", inc]
 
         try:
             proc = subprocess.run(
-                cmd, cwd=repo_root, text=True,
-                capture_output=True, check=False, timeout=timeout_s + 5
+                cmd,
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,          # rc: 0=ok, 1=findings, >=2=error
+                timeout=timeout_s + 5,
+                env=env,
             )
         except subprocess.TimeoutExpired as e:
             raise SemgrepInvocationError(
@@ -69,7 +85,8 @@ def run_semgrep(
             )
 
         if proc.returncode >= 2:
-            raise SemgrepInvocationError(proc.returncode, cmd, proc.stdout or "", proc.stderr or "")
+            # Show more of stderr to surface actual config error text
+            raise SemgrepInvocationError(proc.returncode, cmd, proc.stdout or "", (proc.stderr or "")[-4000:])
 
         data = _parse_json_or_raise(proc.stdout)
         for f in _normalize_results(data.get("results", []) or []):
@@ -77,6 +94,7 @@ def run_semgrep(
                 continue
             findings.append(f)
 
+    # De-dup across chunks
     dedup: Dict[Tuple[str, int, int, str], Dict[str, Any]] = {}
     for f in findings:
         key = (f["path"], int(f["start_line"]), int(f["end_line"]), f.get("rule_id") or "")
@@ -163,12 +181,20 @@ def _resolve_configs(cfg: Optional[str], repo_root: str) -> List[str]:
     return out
 
 def _compute_includes(paths: List[str], repo_root: str) -> List[str]:
+    """
+    Build include globs:
+      - Only source files from PR (filter out .pyc, etc.)
+      - Always-include patterns from env (guarantee bad.py)
+      - Optionally **/*.py if PRSEC_INCLUDE_ALL_PY=1
+    """
     abs_repo = os.path.abspath(repo_root)
     includes: List[str] = []
+
+    # PR files (repo-relative) — keep only .py to avoid Semgrep gripes
     for p in paths or []:
         rel = _rel_to_repo_root(p, abs_repo)
         full = os.path.join(abs_repo, rel)
-        if os.path.isfile(full):
+        if os.path.isfile(full) and rel.endswith(".py"):
             includes.append(rel)
 
     always_env = os.getenv("PRSEC_ALWAYS_INCLUDE_PATTERNS", "").strip()
@@ -180,6 +206,7 @@ def _compute_includes(paths: List[str], repo_root: str) -> List[str]:
     if _truthy(os.getenv("PRSEC_INCLUDE_ALL_PY")):
         includes.append("**/*.py")
 
+    # de-dup, preserve order
     seen = set(); deduped: List[str] = []
     for g in includes:
         g = g.strip()
@@ -188,10 +215,11 @@ def _compute_includes(paths: List[str], repo_root: str) -> List[str]:
     return deduped
 
 def _compute_excludes(extra: Optional[List[str]]) -> List[str]:
-    out = [".venv", "venv", ".git", "node_modules", "__pycache__"]
+    out = [".venv", "venv", ".git", "node_modules", "__pycache__", "**/*.pyc"]
     env_ex = os.getenv("SEMGREP_EXCLUDE", "")
     out.extend([e for e in _split_csv(env_ex) if e])
     if extra: out.extend([e for e in extra if e])
+    # de-dup, preserve order
     seen = set(); deduped: List[str] = []
     for e in out:
         if e not in seen:
@@ -208,7 +236,7 @@ def _parse_json_or_raise(stdout: str) -> Dict[str, Any]:
     try:
         return json.loads(stdout or "{}")
     except json.JSONDecodeError as e:
-        sample = (stdout or "").strip()[:800]
+        sample = (stdout or "").strip()[:1200]
         raise SemgrepInvocationError(exit_code=65, cmd=["semgrep", "--json"], stdout=sample, stderr=str(e))
 
 def _normalize_results(results: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
@@ -287,5 +315,5 @@ def _fmt_semgrep_error(cmd: List[str], code: int, stderr: str) -> str:
     return (
         f"Semgrep failed (exit={code}).\n"
         f"Command: {shlex.join(cmd)}\n"
-        f"STDERR (truncated):\n{(stderr or '').strip()[:800]}"
+        f"STDERR (tail):\n{(stderr or '').strip()}"
     )

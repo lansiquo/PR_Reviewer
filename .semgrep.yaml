@@ -1,3 +1,4 @@
+# inside your _OFFLINE_RULES_YAML triple-quoted string
 rules:
   - id: py-weak-md5
     message: Use of weak hash (md5)
@@ -21,15 +22,11 @@ rules:
     message: Possible shell injection: subprocess.* with shell=True
     severity: ERROR
     languages: [python]
-    patterns:
-      - pattern: subprocess.$F(..., shell=True, ...)
-      - metavariable-pattern:
-          metavariable: $F
-          pattern-either:
-            - pattern: check_output
-            - pattern: run
-            - pattern: Popen
-            - pattern: call
+    pattern-either:
+      - pattern: subprocess.check_output(..., shell=True, ...)
+      - pattern: subprocess.run(..., shell=True, ...)
+      - pattern: subprocess.Popen(..., shell=True, ...)
+      - pattern: subprocess.call(..., shell=True, ...)
 
   - id: py-dangerous-eval
     message: Dangerous use of eval()

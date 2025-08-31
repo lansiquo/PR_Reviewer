@@ -1,28 +1,27 @@
-# Change please
-# # bad.py
-# Intentionally-insecure snippets for Semgrep testing. (touched to trigger scan)
+# bad.py
+# Intentionally insecure snippets for Semgrep testing.
 # Do NOT import or run in production.
-###
 
-import subprocess
 import hashlib
-import pickle
-import yaml
-import requests
-import tempfile
-import random
 import os
+import pickle
+import random
+import subprocess
 import tarfile
+import tempfile
+
+import requests
+import yaml
 
 
-def insecure_md5():
+def insecure_md5() -> str:
     # Weak hash (cryptographic)
     return hashlib.md5(b"abc").hexdigest()
 
 
 def insecure_yaml_load(s: str):
     # Unsafe YAML load (no Loader)
-    return yaml.load(s)  # noqa: PYYAML-load
+    return yaml.load(s)
 
 
 def insecure_pickle_loads(b: bytes):
@@ -30,23 +29,23 @@ def insecure_pickle_loads(b: bytes):
     return pickle.loads(b)
 
 
-def subprocess_shell(user_arg: str):
+def subprocess_shell(user_arg: str) -> bytes:
     # Shell injection risk
     cmd = f"echo {user_arg}"
-    return subprocess.check_output(cmd, shell=True)  # noqa: S602
+    return subprocess.check_output(cmd, shell=True)
 
 
 def eval_usage(expr: str):
     # Dangerous eval
-    return eval(expr)  # noqa: S307
+    return eval(expr)
 
 
 def disable_cert_validation(url: str):
     # SSL verification disabled
-    return requests.get(url, verify=False)  # noqa: B501
+    return requests.get(url, verify=False)
 
 
-def mktemp_race():
+def mktemp_race() -> str:
     # Insecure temp file creation (TOCTOU)
     tmp = tempfile.mktemp()
     with open(tmp, "w") as f:
@@ -54,17 +53,22 @@ def mktemp_race():
     return tmp
 
 
-def insecure_random_token():
+def insecure_random_token() -> str:
     # Non-cryptographic randomness for secrets
     return str(random.random())
 
 
-def tar_extract_all(tar_path: str, dest: str):
+def tar_extract_all(tar_path: str, dest: str) -> None:
     # Path traversal via tarfile extraction
     with tarfile.open(tar_path) as tf:
-        tf.extractall(dest)  # noqa: S202
+        tf.extractall(dest)
+
+
+def os_system_injection(arg: str) -> int:
+    # Another command injection primitive
+    return os.system("ls " + arg)
 
 
 if __name__ == "__main__":
-    # Keep this file non-executable in CI; it only exists for static analysis.
+    # Keep non-executable in CI; exists purely for static analysis.
     pass

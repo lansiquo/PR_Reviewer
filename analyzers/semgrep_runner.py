@@ -1,4 +1,3 @@
-# analyzers/semgrep_runner.py
 from __future__ import annotations
 
 import json
@@ -40,54 +39,74 @@ def run_semgrep(
         "severity": "HIGH",          # CRITICAL/HIGH/MEDIUM/LOW
         "rule_id": "python.lang.subprocess.shell",
         "title": "Subprocess with shell=True",
-        "message": "Using shell=True is dangerous …",
+        "message": "...",
         "fix": "subprocess.run([...], shell=False)",
-        "cwe": "CWE-78",             # optional
-        "owasp": "A01:2021"          # optional
+        "cwe": "CWE-78",
+        "owasp": "A01:2021"
       }
     """
     if not paths:
         return []
 
     semgrep_bin = _ensure_semgrep_available()
-    cfg = _resolve_config(config, repo_root)
-    excludes = exclude or []
+    cfg_value = _resolve_config(config, repo_root)
+
+    # Allow comma/whitespace separated config list → multiple --config flags
+    configs = _split_configs(cfg_value)
+
+    # Excludes (hardened by default)
+    excludes = list(exclude or [])
+    for e in (".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "**/*.pyc", "**/*.pyo", "**/*.class"):
+        if e not in excludes:
+            excludes.append(e)
+
+    # Repo-relative, de-duped includes
+    rel_paths: List[str] = []
+    seen = set()
+    for p in paths:
+        rp = _rel_to_repo_root(p, repo_root)
+        if rp not in seen:
+            rel_paths.append(rp)
+            seen.add(rp)
+
     severity_floor = _severity_floor(os.getenv("PRSEC_SEMGREP_MIN_SEVERITY"))
 
-    # Make paths repo-relative (stable for annotations)
-    rel_paths = [_rel_to_repo_root(p, repo_root) for p in paths]
+    # Base command shared by chunks
+    base_cmd = [
+        semgrep_bin,
+        "--metrics=off",
+        "--json",
+        "--timeout", str(timeout_s),
+        "--skip-unknown-extensions",
+        "--no-rewrite-rule-ids",
+        "--disable-version-check",
+        "--quiet",
+    ]
+    for c in configs:
+        base_cmd += ["--config", c]
+    for pat in excludes:
+        base_cmd += ["--exclude", pat]
 
-    # Semgrep exits:
-    #   0 → no findings
-    #   1 → findings present
-    #  >=2 → error
+    # Harden environment so scans are deterministic
+    env = os.environ.copy()
+    env.setdefault("SEMGREP_ENABLE_GIT_DETECTION", "0")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
     findings: List[Dict[str, Any]] = []
 
-    # Chunk long arg lists to avoid OS argv length limits
+    # Chunk includes to avoid argv limits; scan "." and gate with --include
     for chunk in _chunk(rel_paths, 200):
-        cmd = [
-            semgrep_bin,
-            "--config", cfg,
-            "--json",
-            "--timeout", str(timeout_s),
-            "--skip-unknown-extensions",
-            "--no-rewrite-rule-ids",
-            "--disable-version-check",
-            "--quiet",
-        ]
-        for pat in excludes:
-            cmd += ["--exclude", pat]
-        cmd += chunk
+        cmd = [*base_cmd, ".", *sum((["--include", p] for p in chunk), [])]
 
         try:
-            # Enforce a real wall-clock timeout in addition to Semgrep's own --timeout.
             proc = subprocess.run(
                 cmd,
                 cwd=repo_root,
                 text=True,
                 capture_output=True,
-                check=False,  # we handle rc
-                timeout=timeout_s + 5,  # small buffer around Semgrep's internal timeout
+                check=False,
+                timeout=timeout_s + 5,
+                env=env,
             )
         except subprocess.TimeoutExpired as e:
             raise SemgrepInvocationError(
@@ -97,11 +116,10 @@ def run_semgrep(
                 stderr=f"Semgrep timed out after {timeout_s}s: {e.stderr or ''}",
             )
 
-        rc = proc.returncode
-        if rc >= 2:
-            raise SemgrepInvocationError(rc, cmd, proc.stdout or "", proc.stderr or "")
+        # 0 = no findings; 1 = findings; >=2 = engine/config error
+        if proc.returncode >= 2:
+            raise SemgrepInvocationError(proc.returncode, cmd, proc.stdout or "", proc.stderr or "")
 
-        # parse JSON even if rc==1 (findings present)
         data = _parse_json_or_raise(proc.stdout)
         for f in _normalize_results(data.get("results", []) or []):
             if severity_floor and _sev_order(f["severity"]) < _sev_order(severity_floor):
@@ -197,40 +215,56 @@ def _ensure_semgrep_available() -> str:
 
 def _resolve_config(cfg: Optional[str], repo_root: str) -> str:
     """
-    Resolve SEMGREP config:
+    Resolve config string:
       - if cfg is provided, use it
       - else use env SEMGREP_CONFIG (or typo SEMGRP_CONFIG), else 'p/ci'
-      - if it looks like a local path, make it absolute relative to repo_root
-      - BUT: semgrep registry IDs (p/... or r/...), 'auto', and URLs are NOT paths
+      - local paths are made absolute relative to repo_root
+      - registry IDs (p/... r/...), 'auto', and URLs are passed through
+      - the returned string may contain multiple configs separated by ',' or whitespace
     """
     value = (cfg or os.getenv("SEMGREP_CONFIG") or os.getenv("SEMGRP_CONFIG") or "p/ci").strip()
+    if not value:
+        return "p/ci"
 
-    # pass-through values that are not filesystem paths
-    if (
-        value.startswith(("p/", "r/"))         # Semgrep registry
-        or value in {"auto", "semgrep-auto"}   # special selectors
-        or value.startswith(("http://", "https://"))  # remote config
-    ):
-        return value
-
-    # treat only real paths as paths
-    if _looks_like_path(value):
-        abs_repo = os.path.abspath(repo_root)
-        return os.path.abspath(os.path.join(abs_repo, value))
-
-    return value
+    # If it's a single local path, absolutize it; otherwise pass through
+    # (run_semgrep will split on commas/whitespace)
+    parts = _split_configs(value)
+    absolutized: List[str] = []
+    for p in parts:
+        if _looks_like_local_path(p):
+            absolutized.append(os.path.abspath(os.path.join(os.path.abspath(repo_root), p)))
+        else:
+            absolutized.append(p)
+    return ",".join(absolutized)
 
 
+def _split_configs(s: Optional[str]) -> List[str]:
+    if not s:
+        return ["p/ci"]
+    # split on commas and/or whitespace, preserve order
+    raw = str(s).replace("\n", " ").replace("\t", " ").split(",")
+    tokens: List[str] = []
+    for chunk in raw:
+        for t in chunk.strip().split():
+            if t:
+                tokens.append(t)
+    return tokens or ["p/ci"]
 
-def _looks_like_path(s: str) -> bool:
-    return any(sep in s for sep in ("/", "\\", os.sep)) or s.endswith((".yml", ".yaml"))
+
+def _looks_like_local_path(s: str) -> bool:
+    if s.startswith(("p/", "r/")):
+        return False
+    if s in {"auto", "semgrep-auto"}:
+        return False
+    if s.startswith(("http://", "https://")):
+        return False
+    return any(sep in s for sep in ("/", "\\")) or s.endswith((".yml", ".yaml"))
 
 
 def _parse_json_or_raise(stdout: str) -> Dict[str, Any]:
     try:
         return json.loads(stdout or "{}")
     except json.JSONDecodeError as e:
-        # Trim to avoid log explosions
         sample = (stdout or "").strip()[:800]
         raise SemgrepInvocationError(exit_code=65, cmd=["semgrep", "--json"], stdout=sample, stderr=str(e))
 
@@ -242,10 +276,8 @@ def _normalize_results(results: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, 
         start = r.get("start", {}) or {}
         end = r.get("end", {}) or {}
 
-        # Severity normalization
         sev = _normalize_severity(meta.get("severity") or extra.get("severity") or "LOW")
 
-        # Optional metadata
         cwe_val = meta.get("cwe") or meta.get("cwe_id") or meta.get("cwe_id_vuln")
         if isinstance(cwe_val, list):
             cwe = ", ".join(map(str, cwe_val))
@@ -279,13 +311,11 @@ def _normalize_results(results: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, 
 
 
 def _rel_to_repo_root(path: str, repo_root: str) -> str:
-    # Accept absolute or relative; return repo-relative
     abs_repo = os.path.abspath(repo_root)
     abs_path = os.path.abspath(os.path.join(abs_repo, path))
     try:
         return os.path.relpath(abs_path, abs_repo)
     except ValueError:
-        # Different drive (Windows) — fall back to basename
         return os.path.basename(path)
 
 
@@ -293,29 +323,16 @@ def _normalize_severity(s: str) -> str:
     s = (s or "").strip().upper()
     if s in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
         return s
-    # Semgrep legacy levels → our scale
     if s in {"BLOCKER"}:
         return "CRITICAL"
     if s in {"ERROR"}:
         return "HIGH"
     if s in {"WARNING", "WARN"}:
         return "MEDIUM"
-    # INFO/UNKNOWN → LOW
     return "LOW"
 
 
 def _severity_floor(raw: Optional[str]) -> Optional[str]:
-    """
-    Normalize a minimum-severity filter from env.
-
-    Accepts common synonyms:
-      - NONE/OFF/DISABLE => no filter
-      - CRITICAL/HIGH/MEDIUM/LOW (case-insensitive)
-      - INFO => LOW
-      - WARN/ WARNING => MEDIUM
-      - ERROR => HIGH
-      - BLOCKER => CRITICAL
-    """
     if raw is None:
         return None
     val = (raw or "").strip().upper()
@@ -334,7 +351,6 @@ def _severity_to_annotation_level(sev: str) -> str:
 
 
 def _sev_order(sev: str) -> int:
-    """For filtering: LOW=1, MEDIUM=2, HIGH=3, CRITICAL=4."""
     m = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
     return m.get((sev or "").upper(), 1)
 

@@ -1,3 +1,9 @@
 private-key.pem
 # ignore real env files
+__pycache__/
+*.py[cod]
+*.class
+.venv/
+venv/
 .env
+

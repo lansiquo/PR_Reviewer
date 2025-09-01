@@ -73,7 +73,7 @@ PIPELINE_DEADLINE_S = int(os.getenv("PIPELINE_DEADLINE_S", "90"))
 WATCHDOG_GRACE_S    = int(os.getenv("WATCHDOG_GRACE_S", "20"))
 
 # Scan/reporting
-CHECK_NAME      = os.getenv("PRSEC_CHECK_NAME", "PRSec/Semgrep")
+CHECK_NAME      = os.getenv("PRSEC_CHECK_NAME", "PRSec/Testing")
 SEMGREP_CONFIG  = os.getenv("SEMGREP_CONFIG") or None
 SEMGREP_EXCLUDE = [s for s in (os.getenv("SEMGREP_EXCLUDE") or "").split(",") if s]
 MAX_ANNOTS      = int(os.getenv("PRSEC_MAX_ANNOTATIONS", "200"))

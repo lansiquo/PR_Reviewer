@@ -1,4 +1,4 @@
-name: RobinSec
+name: Security Review 
 
 on:
   pull_request:

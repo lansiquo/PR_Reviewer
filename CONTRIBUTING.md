@@ -1,4 +1,4 @@
-## Dev setup
+##### Dev setup
 1. Use Python 3.11+ (recommended).
 2. Create a virtualenv and install dev deps:
    ```bash

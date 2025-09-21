@@ -1,8 +1,4 @@
-
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 9bf610e (chore(foundations): docs, license, Makefile, protection config)
+9bf610e (chore(foundations): docs, license, Makefile, protection config)
 SHELL := /bin/bash
 PY ?= python3
 BASE_BRANCH ?= main
@@ -56,31 +52,15 @@ release:  ## Tag and create GitHub release: make release VERSION=v0.1.1
 	@git tag -a $(VERSION) -m "$(VERSION)" && git push origin $(VERSION)
 	@gh release create $(VERSION) --title "$(VERSION)" --notes "See CHANGELOG for details."
 	@echo "Release $(VERSION) published."
-=======
-=======
->>>>>>> 9bf610e (chore(foundations): docs, license, Makefile, protection config)
-PROTECTION_FILE := .github/branch-protection/protection.json
-REPO ?= lansiquo/PR_reviewer
-BRANCH ?= main
 
-protect:  ## Apply branch protection
+PROTECTION_FILE := .github/branch-protection/protection.json
+REPO := lansiquo/PR_reviewer
+BRANCH := main
+
+protect:
 	@gh api -X PUT repos/$(REPO)/branches/$(BRANCH)/protection \
 	  -H "Accept: application/vnd.github+json" \
-<<<<<<< HEAD
+
 	  --input $(PROTECTION_FILE)
 	@echo "Branch protection applied to $(REPO)#$(BRANCH)"
->>>>>>> 0c673a8 (Removing Bad.py)
-=======
-	  --input $(PROTECTION_FILE) && echo "Protection applied to $(REPO)#$(BRANCH)"
-
-unprotect:  ## Remove branch protection
-	@gh api -X DELETE repos/$(REPO)/branches/$(BRANCH)/protection \
-	  -H "Accept: application/vnd.github+json" && echo "Protection removed"
-
-# ------- Release -------
-release:  ## Tag and create GitHub release: make release VERSION=v0.1.1
-	@test -n "$(VERSION)" || (echo "Set VERSION=vX.Y.Z"; exit 1)
-	@git tag -a $(VERSION) -m "$(VERSION)" && git push origin $(VERSION)
-	@gh release create $(VERSION) --title "$(VERSION)" --notes "See CHANGELOG for details."
-	@echo "Release $(VERSION) published."
->>>>>>> 9bf610e (chore(foundations): docs, license, Makefile, protection config)
+0c673a8 (Removing Bad.py)

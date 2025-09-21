@@ -1,8 +1,14 @@
-name: pr-security-review
+name: RobinSec
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited, ready_for_review]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+      - '**/*.png'
+      - '**/*.jpg'
+      - '.github/branch-protection/**'
 
 permissions:
   contents: read
@@ -11,27 +17,35 @@ permissions:
   security-events: write
 
 concurrency:
-  group: pr-security-review-${{ github.event.pull_request.number || github.ref }}
+  group: robinsec-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  semgrep:
-    name: semgrep
+  RobinSec:
+    name: RobinSec
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Install Semgrep
         run: pipx install semgrep
 
-      # custom rules + curated packs
- - name: Semgrep (PR-aware)
-  run: semgrep ci --config rules/rules.yaml --config p/security-audit --config p/secrets --timeout 300 --max-target-bytes 200MB
+      - name: Semgrep (PR-aware)
+        run: |
+          semgrep ci \
+            --config rules/rules.yaml \
+            --config p/security-audit \
+            --config p/secrets \
+            --timeout 300 \
+            --max-target-bytes 200MB \
+            --sarif --output results.sarif
 
-
-      - name: Upload SARIF to Code Scanning
+      - name: Upload SARIF to Security tab
         if: always() && hashFiles('results.sarif') != ''
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
-        run: gh code-scanning upload-sarif --commit-sha "$GITHUB_SHA" --ref "$GITHUB_REF" --sarif-file results.sarif
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif

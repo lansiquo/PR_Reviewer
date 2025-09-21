@@ -1,0 +1,46 @@
+name: pr-security-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  security-events: write
+
+concurrency:
+  group: pr-security-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Install Semgrep
+        run: pipx install semgrep
+
+      # custom rules + curated packs
+      - name: Semgrep (fast guardrails)
+        id: scan
+        run: |
+          semgrep scan \
+            --config rules/rules.yaml \
+            --config p/security-audit \
+            --config p/secrets \
+            --exclude node_modules --exclude dist --exclude .git \
+            --max-target-bytes 200MB \
+            --timeout 300 \
+            --error --jobs auto \
+            --sarif --output results.sarif
+
+      - name: Upload SARIF to Code Scanning
+        if: always() && hashFiles('results.sarif') != ''
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        run: gh code-scanning upload-sarif --commit-sha "$GITHUB_SHA" --ref "$GITHUB_REF" --sarif-file results.sarif

@@ -1,6 +1,7 @@
 # ultra_bad.py
 # Intentionally vulnerable examples for static-analysis testing (Semgrep/Bandit/etc).
 # Do NOT run this file. It exists only to exercise rules.
+##
 
 import os
 import sys

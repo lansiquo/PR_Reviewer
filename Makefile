@@ -1,4 +1,5 @@
 9bf610e (chore(foundations): docs, license, Makefile, protection config)
+9bf610e (chore(foundations): docs, license, Makefile, protection config)
 SHELL := /bin/bash
 PY ?= python3
 BASE_BRANCH ?= main
@@ -52,15 +53,13 @@ release:  ## Tag and create GitHub release: make release VERSION=v0.1.1
 	@git tag -a $(VERSION) -m "$(VERSION)" && git push origin $(VERSION)
 	@gh release create $(VERSION) --title "$(VERSION)" --notes "See CHANGELOG for details."
 	@echo "Release $(VERSION) published."
-
 PROTECTION_FILE := .github/branch-protection/protection.json
-REPO := lansiquo/PR_reviewer
-BRANCH := main
+REPO ?= lansiquo/PR_reviewer
+BRANCH ?= main
 
-protect:
+protect:  ## Apply branch protection
 	@gh api -X PUT repos/$(REPO)/branches/$(BRANCH)/protection \
 	  -H "Accept: application/vnd.github+json" \
-
-	  --input $(PROTECTION_FILE)
+	--input $(PROTECTION_FILE)
 	@echo "Branch protection applied to $(REPO)#$(BRANCH)"
 0c673a8 (Removing Bad.py)

@@ -1,4 +1,0 @@
-configs:
-  - p/security-audit
-  - p/python
-  - p/bandit

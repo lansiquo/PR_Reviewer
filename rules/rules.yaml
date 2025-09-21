@@ -1,0 +1,23 @@
+rules:
+  # 1) Obvious footgun: eval()
+  - id: py.dangerous.eval
+    message: "Avoid eval(); prefer ast.literal_eval or safer parsing."
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: eval(...)
+
+  # 2) Suspicious self-compare (example, often a bug)
+  - id: py.suspicious.self-compare
+    message: "Suspicious self-comparison ($X == $X)."
+    severity: WARNING
+    languages: [python]
+    pattern: $X == $X
+
+  # 3) Shell=True is risky (command injection)
+  - id: py.subprocess.shell-true
+    message: "subprocess with shell=True is dangerous; pass an arg list or avoid shell."
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: subprocess.$F(..., shell=True, ...)

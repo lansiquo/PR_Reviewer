@@ -1,0 +1,5 @@
+rules:
+  - pattern: $X == $X
+    message: "Example trivial rule."
+    severity: INFO
+    languages: [python]

@@ -1,5 +1,311 @@
+# security.yaml
+# Purpose: High-signal, complementary rules to catch common gaps not always covered by broad packs.
+# Scope: Python, JavaScript/TypeScript (Node & browser), IaC (Dockerfile, Terraform), GitHub Actions.
+# Philosophy: Prefer low false positive patterns; avoid super-generic string-concat SQL rules that spam.
+
 rules:
-  - pattern: $X == $X
-    message: "Example trivial rule."
+  ###########################################################################
+  # Sanity / Demo (kept INFO so you can confirm the file is wired up)
+  ###########################################################################
+  - id: demo.trivial.self-compare
+    message: "Example trivial rule hit (sanity check)."
     severity: INFO
     languages: [python]
+    pattern: $X == $X
+    metadata:
+      category: demo
+      refs: ["https://semgrep.dev"]
+
+  ###########################################################################
+  # PYTHON — Code Injection, Unsafe APIs, Crypto, SSRF-like patterns
+  ###########################################################################
+  - id: py.eval.exec
+    message: "Use of eval/exec is dangerous; prefer safe evaluators or whitelists."
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: eval($X)
+      - pattern: exec($X)
+    metadata:
+      cwe: ["CWE-94"]
+      owasp: ["A03:2021 Injection"]
+
+  - id: py.subprocess.shell-true
+    message: "subprocess with shell=True can lead to command injection."
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: subprocess.run(..., shell=True, ...)
+      - pattern: subprocess.call(..., shell=True, ...)
+      - pattern: subprocess.Popen(..., shell=True, ...)
+      - pattern: os.system($CMD)
+      - pattern: os.popen($CMD)
+    metadata:
+      cwe: ["CWE-78"]
+      owasp: ["A03:2021 Injection"]
+
+  - id: py.yaml.unsafe-load
+    message: "Use yaml.safe_load instead of yaml.load."
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: yaml.load($X, ...)
+      - pattern-not: yaml.load($X, Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.safe_load($X, ...)
+    metadata:
+      cwe: ["CWE-502"]
+
+  - id: py.requests.insecure-tls
+    message: "TLS verification disabled (verify=False)."
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: requests.get(..., verify=False, ...)
+      - pattern: requests.post(..., verify=False, ...)
+      - pattern: requests.put(..., verify=False, ...)
+      - pattern: requests.delete(..., verify=False, ...)
+    metadata:
+      cwe: ["CWE-295"]
+
+  - id: py.hashlib.weak-hash
+    message: "Weak hash (MD5/SHA1) is not suitable for security purposes."
+    severity: WARNING
+    languages: [python]
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+    metadata:
+      cwe: ["CWE-328"]
+
+  - id: py.pickle.loads
+    message: "Don't unpickle untrusted data."
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+    metadata:
+      cwe: ["CWE-502"]
+
+  - id: py.flask.debug
+    message: "Flask debug mode should not be enabled in production."
+    severity: WARNING
+    languages: [python]
+    pattern: app.run(..., debug=True, ...)
+    metadata:
+      cwe: ["CWE-489"]
+
+  ###########################################################################
+  # JAVASCRIPT / TYPESCRIPT — XSS, Dangerous APIs, Command Exec, TLS bypass
+  ###########################################################################
+  - id: js.eval.new-function
+    message: "Avoid eval/new Function; prefer safe parsers or whitelisted behavior."
+    severity: ERROR
+    languages: [javascript, typescript]
+    pattern-either:
+      - pattern: eval($X)
+      - pattern: new Function($X, ...)
+    metadata:
+      cwe: ["CWE-94"]
+
+  - id: js.dom.innerhtml.sink
+    message: "Assignment to innerHTML can enable XSS. Sanitize or use textContent."
+    severity: ERROR
+    languages: [javascript, typescript]
+    patterns:
+      - pattern: $EL.innerHTML = $X
+      - pattern-not: $EL.innerHTML = DOMPurify.sanitize(...)
+    metadata:
+      cwe: ["CWE-79"]
+
+  - id: js.document.write.sink
+    message: "document.write is dangerous and XSS-prone."
+    severity: ERROR
+    languages: [javascript, typescript]
+    pattern: document.write($X)
+    metadata:
+      cwe: ["CWE-79"]
+
+  - id: node.child_process.exec
+    message: "Command execution APIs are dangerous; prefer spawn w/o shell and strict arg lists."
+    severity: ERROR
+    languages: [javascript, typescript]
+    pattern-either:
+      - pattern: child_process.exec($CMD, ...)
+      - pattern: child_process.execSync($CMD, ...)
+      - pattern: child_process.spawn($CMD, ..., {shell: true, ...})
+      - pattern: require('child_process').exec($CMD, ...)
+      - pattern: require('child_process').execSync($CMD, ...)
+    metadata:
+      cwe: ["CWE-78"]
+
+  - id: node.tls.rejectUnauthorized.false
+    message: "TLS verification disabled (rejectUnauthorized:false)."
+    severity: ERROR
+    languages: [javascript, typescript]
+    pattern: |
+      { rejectUnauthorized: false, ... }
+    metadata:
+      cwe: ["CWE-295"]
+
+  - id: js.react.dangerouslysetinnerhtml
+    message: "dangerouslySetInnerHTML requires strict sanitization."
+    severity: WARNING
+    languages: [javascript, typescript]
+    pattern: < $COMP dangerouslySetInnerHTML = {{ __html: $X }} ... />
+    metadata:
+      cwe: ["CWE-79"]
+
+  ###########################################################################
+  # DOCKERFILE — Pinning, root user, curl|bash
+  ###########################################################################
+  - id: docker.latest.tag
+    message: "Avoid ':latest' tag; pin to a specific digest or version."
+    severity: WARNING
+    languages: [dockerfile]
+    pattern: FROM $IMG:latest
+    metadata:
+      cwe: ["CWE-1104"]
+
+  - id: docker.add.user.root
+    message: "Running as root in containers increases blast radius; create/drop to non-root."
+    severity: WARNING
+    languages: [dockerfile]
+    pattern: USER root
+    metadata:
+      cwe: ["CWE-250"]
+
+  - id: docker.curl.bash.pipe
+    message: "Piping remote scripts to shell is risky. Fetch, verify, then execute."
+    severity: ERROR
+    languages: [dockerfile]
+    pattern-either:
+      - pattern: RUN curl ... | bash
+      - pattern: RUN wget ... | bash
+      - pattern: RUN curl ... | sh
+      - pattern: RUN wget ... | sh
+    metadata:
+      cwe: ["CWE-494"]
+
+  ###########################################################################
+  # TERRAFORM (HCL) — Common misconfigs (S3 public, SG open)
+  ###########################################################################
+  - id: tf.aws.s3.public-acl
+    message: "S3 bucket publicly accessible; block public ACLs/policies."
+    severity: ERROR
+    languages: [hcl]
+    patterns:
+      - pattern: |
+          resource "aws_s3_bucket_acl" $B {
+            acl = "public-read"
+          }
+    metadata:
+      cwe: ["CWE-200"]
+
+  - id: tf.aws.sg.open-ingress
+    message: "Security Group allows 0.0.0.0/0 on common ports; restrict ingress."
+    severity: ERROR
+    languages: [hcl]
+    patterns:
+      - pattern: |
+          resource "aws_security_group" $N {
+            ingress {
+              cidr_blocks = ["0.0.0.0/0"]
+              from_port = $P
+              to_port   = $P
+              protocol  = "tcp"
+            }
+          }
+    metadata:
+      cwe: ["CWE-284"]
+
+  ###########################################################################
+  # GITHUB ACTIONS — Unsafe triggers, unpinned actions
+  ###########################################################################
+  - id: gha.pull_request_target
+    message: "pull_request_target runs with elevated perms; only use with strict safeguards."
+    severity: ERROR
+    languages: [yaml]
+    pattern: |
+      on:
+        pull_request_target: ...
+    metadata:
+      refs: ["https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request_target"]
+      cwe: ["CWE-94", "CWE-862"]
+
+  - id: gha.unpinned.actions
+    message: "Pin third-party actions to a commit SHA (not a floating tag)."
+    severity: WARNING
+    languages: [yaml]
+    patterns:
+      - pattern: uses: $OWNER/$REPO@$TAG
+      - pattern-not: uses: $OWNER/$REPO@sha256:$SHA
+      - pattern-not: uses: $OWNER/$REPO@$SHA
+    metadata:
+      refs: ["https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-third-party-actions"]
+      cwe: ["CWE-494"]
+
+  ###########################################################################
+  # PHP — Dangerous sinks (kept tight to reduce noise)
+  ###########################################################################
+  - id: php.eval.exec.system
+    message: "Dangerous execution function; validate inputs or remove."
+    severity: ERROR
+    languages: [php]
+    pattern-either:
+      - pattern: eval($X)
+      - pattern: system($X)
+      - pattern: exec($X)
+      - pattern: shell_exec($X)
+      - pattern: passthru($X)
+    metadata:
+      cwe: ["CWE-78", "CWE-94"]
+
+  - id: php.include.variable
+    message: "Dynamic include/require can lead to RFI/LFI."
+    severity: ERROR
+    languages: [php]
+    pattern-either:
+      - pattern: include($X)
+      - pattern: include_once($X)
+      - pattern: require($X)
+      - pattern: require_once($X)
+    metadata:
+      cwe: ["CWE-98"]
+
+  ###########################################################################
+  # GO — Command exec, weak crypto, TLS off
+  ###########################################################################
+  - id: go.exec.command
+    message: "exec.Command with variable command/args can be injection-prone."
+    severity: ERROR
+    languages: [go]
+    pattern-either:
+      - pattern: exec.Command($X, ...)
+      - pattern: exec.CommandContext($CTX, $X, ...)
+    metadata:
+      cwe: ["CWE-78"]
+
+  - id: go.crypto.weak-hash
+    message: "Avoid md5/sha1 for security contexts."
+    severity: WARNING
+    languages: [go]
+    pattern-either:
+      - pattern: md5.New()
+      - pattern: sha1.New()
+    metadata:
+      cwe: ["CWE-328"]
+
+  - id: go.http.insecure-tls
+    message: "Insecure transport: InsecureSkipVerify=true."
+    severity: ERROR
+    languages: [go]
+    pattern: &insecuretls |
+      &tls.Config{ InsecureSkipVerify: true, ... }
+    metadata:
+      cwe: ["CWE-295"]
+
+  ###########################################################################
+  # QUALITY-OF-LIFE: Generic secrets (kept off—handled by p/secrets)
+  # QUALITY-OF-LIFE: Generic SQL concat rules (omitted to avoid PR spam)
+  ###########################################################################

@@ -13,4 +13,4 @@ FastAPI service that receives GitHub App webhooks, scans PR diffs with simple ru
 ## Notes
 - Uses **commit statuses** for simplicity. You can upgrade to **Checks API** for rich annotations later.
 - Only scans **added lines** in supported files.
-- No code is stored; logs redact sensitive values.
+- No code is stored; logs redact sensitive values.# naughty push

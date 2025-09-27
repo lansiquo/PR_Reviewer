@@ -3,13 +3,7 @@ name: pr-security-review
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited, ready_for_review]
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - '**/*.txt'
-      - '**/*.png'
-      - '**/*.jpg'
-      - '.github/branch-protection/**'
+    # No branches/paths filters so the required check always runs
 
 permissions:
   contents: read
@@ -23,50 +17,86 @@ concurrency:
 
 jobs:
   robin-sec:
-    name: Robin Sec            # <-- keep this EXACT to match your required check
+    name: Robin Sec
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # full history for reliable diffing
+          fetch-depth: 0
 
-      - name: Ensure base ref is present locally
+      # Start a check-run named EXACTLY "Robin Sec" so branch protection sees it
+      - name: Start Robin Sec check-run
+        id: start_check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const headSha = context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+            const resp = await github.request('POST /repos/{owner}/{repo}/check-runs', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Robin Sec',
+              head_sha: headSha,
+              status: 'in_progress'
+            });
+            core.setOutput('id', resp.data.id);
+
+      # Determine base and ensure it's fetched so delta/baseline works
+      - name: Ensure base ref is present
+        id: base
         run: |
+          set -euo pipefail
           BASE="${{ github.base_ref || 'main' }}"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
           git fetch origin "$BASE:$BASE" --update-head-ok || true
-          git branch -vv
+
+      # Detect docs-only changes -> skip Semgrep but still complete the check
+      - name: Paths filter
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - '**/*'
+              - '!**/*.md'
+              - '!**/*.txt'
+              - '!**/*.png'
+              - '!**/*.jpg'
+              - '!.github/branch-protection/**'
 
       - name: Cache Semgrep rules
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.semgrep
           key: semgrep-${{ runner.os }}-v1
 
       - name: Install Semgrep
+        if: steps.changes.outputs.code == 'true'
         run: pipx install semgrep
 
-      - name: Semgrep (delta with safety limits)
+      - name: Semgrep (delta or baseline)
+        if: steps.changes.outputs.code == 'true'
         id: scan
         shell: bash
         run: |
           set -euo pipefail
-          BASE="${{ github.base_ref || 'main' }}"
+          BASE='${{ steps.base.outputs.base }}'
 
           if semgrep --help | grep -q -- '--changed-since'; then
             semgrep scan \
               --config rules/ \
               --config p/security-audit \
               --config p/secrets \
-              --changed-since "$BASE" \
+              --changed-since "origin/$BASE" \
               --exclude node_modules --exclude dist --exclude .git \
               --max-target-bytes 200MB \
               --timeout 300 \
               --error --jobs auto \
               --sarif --output results.sarif
           else
-            MERGE_BASE="$(git merge-base HEAD "$BASE")"
+            MERGE_BASE="$(git merge-base HEAD "origin/$BASE")"
             semgrep scan \
               --config rules/ \
               --config p/security-audit \
@@ -80,7 +110,27 @@ jobs:
           fi
 
       - name: Upload SARIF to Code Scanning
-        if: always() && hashFiles('results.sarif') != ''
+        if: steps.changes.outputs.code == 'true' && always() && hashFiles('results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
+
+      # Complete the "Robin Sec" check-run with success/failure
+      - name: Complete Robin Sec check-run
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const id = Number('${{ steps.start_check.outputs.id }}');
+            // Default success unless Semgrep step ran and failed
+            let conclusion = 'success';
+            if ('${{ steps.changes.outputs.code }}' === 'true' && '${{ steps.scan.outcome }}' !== 'success') {
+              conclusion = 'failure';
+            }
+            await github.request('PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              check_run_id: id,
+              status: 'completed',
+              conclusion
+            });

@@ -3,7 +3,7 @@ name: pr-security-review
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited, ready_for_review]
-    branches: [main]                # limit to PRs targeting main (adjust if needed)
+    branches: [main]
     paths-ignore:
       - '**/*.md'
       - '**/*.txt'
@@ -22,15 +22,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  semgrep:
-    name: semgrep
+  robin-sec:
+    name: Robin Sec            # <-- keep this EXACT to match your required check
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0             # needed for diff/baseline
+          fetch-depth: 0        # full history for reliable diffing
+
+      - name: Ensure base ref is present locally
+        run: |
+          BASE="${{ github.base_ref || 'main' }}"
+          git fetch origin "$BASE:$BASE" --update-head-ok || true
+          git branch -vv
 
       - name: Cache Semgrep rules
         uses: actions/cache@v4
@@ -41,30 +47,26 @@ jobs:
       - name: Install Semgrep
         run: pipx install semgrep
 
-      # Use delta scan where supported; fall back to baseline filtering otherwise
       - name: Semgrep (delta with safety limits)
         id: scan
         shell: bash
         run: |
           set -euo pipefail
-          BASE="${{ github.base_ref }}"
-          [[ -z "$BASE" ]] && BASE=main
+          BASE="${{ github.base_ref || 'main' }}"
 
-          # Prefer delta scanning (Semgrep >= 1.39 supports --changed-since)
           if semgrep --help | grep -q -- '--changed-since'; then
             semgrep scan \
               --config rules/ \
               --config p/security-audit \
               --config p/secrets \
-              --changed-since "origin/$BASE" \
+              --changed-since "$BASE" \
               --exclude node_modules --exclude dist --exclude .git \
               --max-target-bytes 200MB \
               --timeout 300 \
               --error --jobs auto \
               --sarif --output results.sarif
           else
-            # Fallback: scan all but only report findings introduced since merge-base
-            MERGE_BASE="$(git merge-base HEAD "origin/$BASE")"
+            MERGE_BASE="$(git merge-base HEAD "$BASE")"
             semgrep scan \
               --config rules/ \
               --config p/security-audit \
@@ -77,7 +79,6 @@ jobs:
               --sarif --output results.sarif
           fi
 
-      # Upload SARIF via the supported action (no reliance on gh being present)
       - name: Upload SARIF to Code Scanning
         if: always() && hashFiles('results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3

@@ -3,7 +3,7 @@ name: pr-security-review
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited, ready_for_review]
-    branches: [main]
+    branches: [main]                # limit to PRs targeting main (adjust if needed)
     paths-ignore:
       - '**/*.md'
       - '**/*.txt'
@@ -30,10 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0             # needed for diff/baseline
 
-      # Optional: cache to speed up Semgrep rule downloads
-      - name: Cache semgrep
+      - name: Cache Semgrep rules
         uses: actions/cache@v4
         with:
           path: ~/.semgrep
@@ -42,42 +41,45 @@ jobs:
       - name: Install Semgrep
         run: pipx install semgrep
 
-      - name: Compute changed range
-        id: range
-        run: |
-          echo "base_ref=${{ github.base_ref || 'main' }}" >> "$GITHUB_OUTPUT"
-          echo "head_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-
+      # Use delta scan where supported; fall back to baseline filtering otherwise
       - name: Semgrep (delta with safety limits)
         id: scan
+        shell: bash
         run: |
-          semgrep scan \
-            --config rules/ \
-            --changed-since origin/${{ steps.range.outputs.base_ref }} \
-            --exclude node_modules --exclude dist --exclude .git \
-            --max-target-bytes 200MB \
-            --timeout 300 \
-            --json --output semgrep.json \
-            --sarif --output results.sarif \
-            --error --jobs auto
-        # If you prefer warn-only initially, drop --error and handle fail below.
+          set -euo pipefail
+          BASE="${{ github.base_ref }}"
+          [[ -z "$BASE" ]] && BASE=main
 
+          # Prefer delta scanning (Semgrep >= 1.39 supports --changed-since)
+          if semgrep --help | grep -q -- '--changed-since'; then
+            semgrep scan \
+              --config rules/ \
+              --config p/security-audit \
+              --config p/secrets \
+              --changed-since "origin/$BASE" \
+              --exclude node_modules --exclude dist --exclude .git \
+              --max-target-bytes 200MB \
+              --timeout 300 \
+              --error --jobs auto \
+              --sarif --output results.sarif
+          else
+            # Fallback: scan all but only report findings introduced since merge-base
+            MERGE_BASE="$(git merge-base HEAD "origin/$BASE")"
+            semgrep scan \
+              --config rules/ \
+              --config p/security-audit \
+              --config p/secrets \
+              --baseline-commit "$MERGE_BASE" \
+              --exclude node_modules --exclude dist --exclude .git \
+              --max-target-bytes 200MB \
+              --timeout 300 \
+              --error --jobs auto \
+              --sarif --output results.sarif
+          fi
+
+      # Upload SARIF via the supported action (no reliance on gh being present)
       - name: Upload SARIF to Code Scanning
         if: always() && hashFiles('results.sarif') != ''
-        run: |
-          gh code-scanning upload-sarif \
-            --commit-sha "$GITHUB_SHA" \
-            --ref "$GITHUB_REF" \
-            --sarif-file results.sarif
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Make the job clearly pass/fail, not hang
-      - name: Set conclusion
-        if: always()
-        run: |
-          # Fail if Semgrep step failed; otherwise succeed
-          if [ "${{ steps.scan.outcome }}" = "failure" ]; then
-            echo "Semgrep reported errors or findings (with --error). Failing job."
-            exit 1
-          fi
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif

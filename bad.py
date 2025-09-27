@@ -1,5 +1,6 @@
 # bad.py - intentionally insecure sample for training/detection
 # DO NOT RUN ON A PUBLIC/PRODUCTION SYSTEM
+# Can you see me
 
 import os
 import subprocess

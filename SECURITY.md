@@ -1,4 +1,4 @@
-# Security Policy
+## Security Policy
 
 ## Supported versions
 We release security fixes on the latest minor version.

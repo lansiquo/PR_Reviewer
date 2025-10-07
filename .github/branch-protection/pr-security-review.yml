@@ -3,13 +3,7 @@ name: pr-security-review
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited, ready_for_review]
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - '**/*.txt'
-      - '**/*.png'
-      - '**/*.jpg'
-      - '.github/branch-protection/**'
+    # No branches/paths filters so the required check always runs
 
 permissions:
   contents: read
@@ -22,8 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  semgrep:
-    name: semgrep
+  robin-sec:
+    name: Robin Sec
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -32,52 +26,111 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Optional: cache to speed up Semgrep rule downloads
-      - name: Cache semgrep
+      # Start a check-run named EXACTLY "Robin Sec" so branch protection sees it
+      - name: Start Robin Sec check-run
+        id: start_check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const headSha = context.payload.pull_request ? context.payload.pull_request.head.sha : context.sha;
+            const resp = await github.request('POST /repos/{owner}/{repo}/check-runs', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Robin Sec',
+              head_sha: headSha,
+              status: 'in_progress'
+            });
+            core.setOutput('id', resp.data.id);
+
+      # Determine base and ensure it's fetched so delta/baseline works
+      - name: Ensure base ref is present
+        id: base
+        run: |
+          set -euo pipefail
+          BASE="${{ github.base_ref || 'main' }}"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          git fetch origin "$BASE:$BASE" --update-head-ok || true
+
+      # Detect docs-only changes -> skip Semgrep but still complete the check
+      - name: Paths filter
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - '**/*'
+              - '!**/*.md'
+              - '!**/*.txt'
+              - '!**/*.png'
+              - '!**/*.jpg'
+              - '!.github/branch-protection/**'
+
+      - name: Cache Semgrep rules
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.semgrep
           key: semgrep-${{ runner.os }}-v1
 
       - name: Install Semgrep
+        if: steps.changes.outputs.code == 'true'
         run: pipx install semgrep
 
-      - name: Compute changed range
-        id: range
-        run: |
-          echo "base_ref=${{ github.base_ref || 'main' }}" >> "$GITHUB_OUTPUT"
-          echo "head_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-
-      - name: Semgrep (delta with safety limits)
+      - name: Semgrep (delta or baseline)
+        if: steps.changes.outputs.code == 'true'
         id: scan
+        shell: bash
         run: |
-          semgrep scan \
-            --config rules/ \
-            --changed-since origin/${{ steps.range.outputs.base_ref }} \
-            --exclude node_modules --exclude dist --exclude .git \
-            --max-target-bytes 200MB \
-            --timeout 300 \
-            --json --output semgrep.json \
-            --sarif --output results.sarif \
-            --error --jobs auto
-        # If you prefer warn-only initially, drop --error and handle fail below.
+          set -euo pipefail
+          BASE='${{ steps.base.outputs.base }}'
+
+          if semgrep --help | grep -q -- '--changed-since'; then
+            semgrep scan \
+              --config rules/ \
+              --config p/security-audit \
+              --config p/secrets \
+              --changed-since "origin/$BASE" \
+              --exclude node_modules --exclude dist --exclude .git \
+              --max-target-bytes 200MB \
+              --timeout 300 \
+              --error --jobs auto \
+              --sarif --output results.sarif
+          else
+            MERGE_BASE="$(git merge-base HEAD "origin/$BASE")"
+            semgrep scan \
+              --config rules/ \
+              --config p/security-audit \
+              --config p/secrets \
+              --baseline-commit "$MERGE_BASE" \
+              --exclude node_modules --exclude dist --exclude .git \
+              --max-target-bytes 200MB \
+              --timeout 300 \
+              --error --jobs auto \
+              --sarif --output results.sarif
+          fi
 
       - name: Upload SARIF to Code Scanning
-        if: always() && hashFiles('results.sarif') != ''
-        run: |
-          gh code-scanning upload-sarif \
-            --commit-sha "$GITHUB_SHA" \
-            --ref "$GITHUB_REF" \
-            --sarif-file results.sarif
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if: steps.changes.outputs.code == 'true' && always() && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
 
-      # Make the job clearly pass/fail, not hang
-      - name: Set conclusion
+      # Complete the "Robin Sec" check-run with success/failure
+      - name: Complete Robin Sec check-run
         if: always()
-        run: |
-          # Fail if Semgrep step failed; otherwise succeed
-          if [ "${{ steps.scan.outcome }}" = "failure" ]; then
-            echo "Semgrep reported errors or findings (with --error). Failing job."
-            exit 1
-          fi
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const id = Number('${{ steps.start_check.outputs.id }}');
+            // Default success unless Semgrep step ran and failed
+            let conclusion = 'success';
+            if ('${{ steps.changes.outputs.code }}' === 'true' && '${{ steps.scan.outcome }}' !== 'success') {
+              conclusion = 'failure';
+            }
+            await github.request('PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              check_run_id: id,
+              status: 'completed',
+              conclusion
+            });
